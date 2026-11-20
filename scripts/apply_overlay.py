@@ -253,6 +253,72 @@ def main() -> None:
         'keepDebugSymbols += "**/libopencode.so"',
     )
 
+    # 12) 人设页：路由常量
+    patch(
+        nav,
+        '    const val DISPATCH = "agent_dispatch"',
+        '    const val DISPATCH = "agent_dispatch"\n'
+        '    const val PERSONAS = "personas"',
+        "人设路由常量",
+        'const val PERSONAS = "personas"',
+    )
+
+    # 13) 人设页：设置项回调参数
+    patch(
+        settings,
+        "    onDispatchClick: () -> Unit = {},\n) {",
+        "    onDispatchClick: () -> Unit = {},\n"
+        "    // 人设管理（群成员的来源）\n"
+        "    onPersonaClick: () -> Unit = {},\n) {",
+        "人设回调参数",
+        "onPersonaClick: () -> Unit = {}",
+    )
+
+    # 14) 人设页：设置入口行（紧跟多 Agent 派发）
+    patch(
+        settings,
+        "                    onClick = onDispatchClick,\n"
+        "                    showDivider = false,\n"
+        "                )\n",
+        "                    onClick = onDispatchClick,\n"
+        "                    showDivider = true,\n"
+        "                )\n"
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.BarChart,\n"
+        "                    iconColor = Color(0xFFAF52DE),\n"
+        '                    title = "人设",\n'
+        '                    subtitle = "创建成员人格，供群聊绑定",\n'
+        "                    onClick = onPersonaClick,\n"
+        "                    showDivider = false,\n"
+        "                )\n",
+        "人设设置入口",
+        'title = "人设"',
+    )
+
+    # 15) 人设页：导航回调
+    patch(
+        nav,
+        "                onDispatchClick = { navController.safeNavigate(Routes.DISPATCH) },\n",
+        "                onDispatchClick = { navController.safeNavigate(Routes.DISPATCH) },\n"
+        "                onPersonaClick = { navController.safeNavigate(Routes.PERSONAS) },\n",
+        "人设导航回调",
+        "onPersonaClick = { navController.safeNavigate(Routes.PERSONAS) }",
+    )
+
+    # 16) 人设页：注册目标页面
+    patch(
+        nav,
+        "        composable(Routes.BACKUP) { entry ->",
+        "        composable(Routes.PERSONAS) {\n"
+        "            com.openminis.app.ui.opencode.PersonaScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.BACKUP) { entry ->",
+        "人设页面注册",
+        "composable(Routes.PERSONAS)",
+    )
+
     print("注入完成。")
 
 if __name__ == "__main__":

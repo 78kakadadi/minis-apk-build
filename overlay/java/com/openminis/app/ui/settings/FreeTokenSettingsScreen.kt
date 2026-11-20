@@ -18,13 +18,19 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,56 +44,52 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.openminis.app.ext.opencode.policy.FreeTierTool
-import com.openminis.app.ext.opencode.policy.ShellCommandBuilder
-import com.openminis.app.ext.opencode.runtime.OpencodeLayout
+import com.openminis.app.ext.opencode.runtime.FreeTokenManager
+import com.openminis.app.ext.opencode.runtime.FreeTokenStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
 
+private val OK_GREEN = Color(0xFF32D74B)
+private val WARN_ORANGE = Color(0xFFFF9F0A)
+private val ERR_RED = Color(0xFFFF453A)
+
 /**
- * 免费 Token 通道（内嵌 OpenCode）设置页。
+ * 免费 Token 通道设置页。
  *
- * 本页三件事：
- * 1. 展示运行时目录的真实落点（不创建，只查）；
- * 2. 展示上游硬性要求的四个工具名与 Minis 实际工具名的映射——这是 403 的根因；
- * 3. 「运行自检」直接 execve nativeLibraryDir/libopencode.so，验证它真的可执行。
- *
- * 第 3 点是整条通道的地基：Android 10+ 只允许从 nativeLibraryDir 执行二进制，
- * 这一步若报 Permission denied，后面的 serve / SSE / 模型调用全都不成立。
+ * 这个页面的职责只有一个：**让通道真的跑起来，并且在跑不起来时说清楚是哪一步**。
+ * 早先版本只展示「文件是否存在」，用户点不到任何能产生请求的东西，于是看起来
+ * 一切正常却完全没法用。现在页面顶部就是状态与开关，下面是可验证的实测对话。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FreeTokenSettingsScreen(
-    onBack: () -> Unit,
-) {
+fun FreeTokenSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
+    val manager = remember { FreeTokenManager.get(context) }
+    val status by manager.status.collectAsState()
+    val models by manager.models.collectAsState()
+
     val scope = rememberCoroutineScope()
+    var testInput by remember { mutableStateOf("用一句话介绍你自己") }
+    var testOutput by remember { mutableStateOf("") }
+    var testing by remember { mutableStateOf(false) }
+    var showLogs by remember { mutableStateOf(false) }
+    var logText by remember { mutableStateOf("") }
+    var selectedModel by remember { mutableStateOf(manager.defaultModel) }
 
-    val layout = remember { OpencodeLayout(context.filesDir) }
-    val configExists = remember { layout.configFile.exists() }
-    val serviceExists = remember { layout.serviceFile.exists() }
+    // 用户上次启用过就自动拉起，否则停在「未启用」等一次明确点击
+    LaunchedEffect(Unit) { manager.autoStartIfOptedIn() }
 
-    // 规格要求的唯一合法可执行目录
-    val elf = remember {
-        File(context.applicationInfo.nativeLibraryDir, "libopencode.so")
-    }
-    val elfPresent = remember { elf.exists() }
-    val elfExecutable = remember { elf.canExecute() }
-
-    val toolRows = remember { FreeTierTool.ALL }
-    val sampleGrep = remember {
-        ShellCommandBuilder.grep("TODO", path = "src", include = "kt", limit = 20)
-    }
-    val sampleGlob = remember {
-        ShellCommandBuilder.glob("**/*.kt", path = "app")
-    }
-
-    var probing by remember { mutableStateOf(false) }
-    var probeResult by remember { mutableStateOf<String?>(null) }
-    var probeOk by remember { mutableStateOf(false) }
+    val running = status is FreeTokenStatus.Running
+    val working = status is FreeTokenStatus.Working
 
     Scaffold(
         topBar = {
@@ -95,10 +97,7 @@ fun FreeTokenSettingsScreen(
                 title = { Text("免费 Token 通道") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
-                        )
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                     }
                 },
             )
@@ -112,233 +111,282 @@ fun FreeTokenSettingsScreen(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            // ---------- 原生二进制 ----------
+            // ---------- 状态与开关 ----------
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 shape = RoundedCornerShape(12.dp),
             ) {
                 Column(
                     modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text(
-                        text = "原生二进制",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    StatusLine(
-                        label = "文件存在",
-                        value = if (elfPresent) "是" else "否（未打进安装包）",
-                        ok = elfPresent,
-                    )
-                    StatusLine(
-                        label = "可执行位",
-                        value = if (elfExecutable) "已就绪" else "无执行权限",
-                        ok = elfExecutable,
-                    )
-                    StatusLine(
-                        label = "路径",
-                        value = elf.absolutePath,
-                        ok = false,
-                        mono = true,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "状态",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        StatusChip(status)
+                    }
 
-                    Spacer(Modifier.height(4.dp))
-                    Button(
-                        onClick = {
-                            probing = true
-                            probeResult = null
-                            scope.launch {
-                                val (ok, text) = withContext(Dispatchers.IO) {
-                                    probeElf(elf)
-                                }
-                                probeOk = ok
-                                probeResult = text
-                                probing = false
+                    when (val s = status) {
+                        is FreeTokenStatus.Off -> Text(
+                            text = "未启用。启用后会在本机拉起 OpenCode 运行时，" +
+                                "并把免费模型注册进 Minis 的模型列表。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        is FreeTokenStatus.Working -> {
+                            Text(
+                                text = "${s.step}（${s.progress}%）",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        is FreeTokenStatus.Running -> {
+                            Line("接入地址", s.baseUrl, mono = true, ok = true)
+                            Line("当前模型", s.model ?: "未选择", mono = true, ok = s.model != null)
+                        }
+                        is FreeTokenStatus.Error -> {
+                            Line("失败原因", s.message, ok = false)
+                            if (!s.retryable) {
+                                Text(
+                                    text = "这条错误无法靠重试恢复，需要换一个包含运行时的安装包。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ERR_RED,
+                                )
                             }
-                        },
-                        enabled = !probing && elfPresent,
-                    ) {
-                        Text(if (probing) "检测中…" else "运行自检")
+                        }
                     }
 
-                    probeResult?.let { text ->
-                        Spacer(Modifier.height(6.dp))
-                        CommandBox(text, ok = probeOk)
+                    Spacer(Modifier.height(2.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (!running) {
+                            Button(
+                                onClick = { manager.enable() },
+                                enabled = !working,
+                            ) { Text(if (working) "启动中…" else "启用通道") }
+                        } else {
+                            Button(onClick = { manager.disable() }) { Text("停用") }
+                        }
+                        OutlinedButton(
+                            onClick = { manager.restart() },
+                            enabled = !working,
+                        ) { Text("重启服务") }
+                        OutlinedButton(
+                            onClick = { manager.refreshModels() },
+                            enabled = running,
+                        ) { Text("刷新模型") }
+                    }
+                    if (running) {
+                        TextButton(onClick = { manager.startNewConversation() }) {
+                            Text("开始新对话（清空服务端上下文）")
+                        }
                     }
                 }
             }
 
-            // ---------- 运行时目录 ----------
+            // ---------- 模型 ----------
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Text(
-                        text = "运行时目录",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    StatusLine(label = "根目录", value = layout.root.absolutePath, ok = false, mono = true)
-                    StatusLine(
-                        label = "配置文件",
-                        value = if (configExists) "已生成" else "未生成",
-                        ok = configExists,
-                    )
-                    StatusLine(
-                        label = "服务身份",
-                        value = if (serviceExists) "已注册" else "未注册",
-                        ok = serviceExists,
-                    )
-                }
-            }
-
-            // ---------- 工具名映射 ----------
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 shape = RoundedCornerShape(12.dp),
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "工具名映射",
+                        text = "免费模型（${models.size}）",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = "上游只接受左侧四个名字，Minis 实际用的是右侧。" +
-                            "名字对不上会被拒绝，而报错文案会误导成「没装 OpenCode」。",
+                        text = "清单来自运行时实时的 /config/providers，每次刷新都可能变化。" +
+                            "选中后作为默认模型使用。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(Modifier.height(10.dp))
-                    Row(modifier = Modifier.fillMaxWidth()) {
+                    Spacer(Modifier.height(8.dp))
+                    if (models.isEmpty()) {
                         Text(
-                            "上游要求",
-                            modifier = Modifier.width(96.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            text = if (running) "尚未发现免费模型，点上面的「刷新模型」。" else "启用通道后加载。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = WARN_ORANGE,
                         )
-                        Text(
-                            "Minis 实际",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    } else {
+                        models.forEach { m ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                FilterChip(
+                                    selected = selectedModel == m.id,
+                                    onClick = {
+                                        selectedModel = m.id
+                                        manager.selectModel(m.id)
+                                    },
+                                    label = { Text(m.label, fontSize = 12.sp) },
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = m.id,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
+                }
+            }
+
+            // ---------- 实测 ----------
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "发一条真实请求",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
                     Spacer(Modifier.height(4.dp))
-                    toolRows.forEach { row ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                    Text(
+                        text = "直接打到本机桥接的 /v1/chat/completions，绕过 UI 验证整条链路。" +
+                            "这里成功，聊天里就一定成功。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = testInput,
+                        onValueChange = { testInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("测试消息") },
+                        minLines = 2,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            testing = true
+                            testOutput = ""
+                            val base = manager.bridgeBaseUrl
+                            if (base == null) {
+                                testOutput = "通道未运行，先点「启用通道」。"
+                                testing = false
+                            } else {
+                                scope.launch {
+                                    testOutput = withContext(Dispatchers.IO) {
+                                        runTest(base, selectedModel ?: manager.defaultModel, testInput)
+                                    }
+                                    testing = false
+                                }
+                            }
+                        },
+                        enabled = !testing && running,
+                    ) { Text(if (testing) "请求中…" else "发送") }
+
+                    if (testOutput.isNotBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1C1C1E)),
+                            shape = RoundedCornerShape(8.dp),
                         ) {
                             Text(
-                                text = row.mcpName,
-                                modifier = Modifier.width(96.dp),
+                                text = testOutput,
+                                modifier = Modifier.padding(10.dp),
                                 fontFamily = FontFamily.Monospace,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium,
-                            )
-                            Text(
-                                text = row.minisTool,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 13.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 12.sp,
+                                color = if (testOutput.startsWith("失败")) ERR_RED else OK_GREEN,
                             )
                         }
                     }
                 }
             }
 
-            // ---------- 命令拼装 ----------
+            // ---------- 运行时诊断 ----------
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 shape = RoundedCornerShape(12.dp),
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
+                    val elf = remember { File(context.applicationInfo.nativeLibraryDir, "libopencode.so") }
                     Text(
-                        text = "命令拼装（实时计算）",
+                        text = "运行时诊断",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = "glob / grep 由 shell 命令实现，参数全部做引号转义，含路径穿越拦截。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    CommandBox(sampleGlob, ok = true)
                     Spacer(Modifier.height(6.dp))
-                    CommandBox(sampleGrep, ok = true)
+                    Line("二进制", if (elf.exists()) elf.absolutePath else "缺失（安装包未包含）", mono = true, ok = elf.exists())
+                    Line("可执行", if (elf.canExecute()) "是" else "否", ok = elf.canExecute())
+                    Line("上次端口", manager.lastPort().toString(), mono = true, ok = manager.lastPort() > 0)
+                    Line("上游注册", "设置 › 模型 中查看「${FreeTokenManager.LABEL}」", ok = true)
+
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            showLogs = !showLogs
+                            if (showLogs) logText = manager.logs()
+                        }) { Text(if (showLogs) "收起日志" else "查看日志") }
+                        OutlinedButton(onClick = {
+                            scope.launch(Dispatchers.IO) { manager.probeNow() }
+                        }) { Text("探活") }
+                    }
+                    if (showLogs) {
+                        Spacer(Modifier.height(8.dp))
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1C1C1E)),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = logText.ifBlank { "（暂无日志）" },
+                                modifier = Modifier.padding(10.dp),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                color = Color(0xFFB0B0B0),
+                            )
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/**
- * 执行 `libopencode.so --version`。
- *
- * 用绝对路径直接 execve，不经 shell——只有这样才能验证「二进制本身可执行」，
- * 而不是「bash 能跑」。这正是规格 §308 的判定条件。
- */
-private fun probeElf(elf: File): Pair<Boolean, String> {
-    if (!elf.exists()) return false to "文件不存在：${elf.absolutePath}"
-    if (!elf.canExecute()) return false to "缺少执行权限：${elf.absolutePath}"
-    return try {
-        val process = ProcessBuilder(elf.absolutePath, "--version")
-            .redirectErrorStream(true)
-            .start()
-        val output = process.inputStream.bufferedReader().use { it.readText() }
-        val finished = process.waitFor(25, TimeUnit.SECONDS)
-        if (!finished) {
-            process.destroyForcibly()
-            return false to "执行超时（25 秒未返回）"
-        }
-        val code = process.exitValue()
-        val trimmed = output.trim().take(500)
-        if (code == 0 && trimmed.isNotEmpty()) {
-            true to "exit=0\n$trimmed"
-        } else {
-            false to "exit=$code\n$trimmed"
-        }
-    } catch (e: Exception) {
-        false to "启动失败：${e.javaClass.simpleName}: ${e.message}"
+@Composable
+private fun StatusChip(status: FreeTokenStatus) {
+    val (text, color) = when (status) {
+        is FreeTokenStatus.Off -> "未启用" to Color(0xFF8E8E93)
+        is FreeTokenStatus.Working -> "启动中" to WARN_ORANGE
+        is FreeTokenStatus.Running -> "运行中" to OK_GREEN
+        is FreeTokenStatus.Error -> "失败" to ERR_RED
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.15f)),
+        shape = RoundedCornerShape(6.dp),
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            color = color,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+        )
     }
 }
 
 @Composable
-private fun StatusLine(
-    label: String,
-    value: String,
-    ok: Boolean,
-    mono: Boolean = false,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
-    ) {
+private fun Line(label: String, value: String, mono: Boolean = false, ok: Boolean) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         Text(
             text = label,
-            modifier = Modifier.width(76.dp),
+            modifier = Modifier.width(72.dp),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -347,26 +395,41 @@ private fun StatusLine(
             modifier = Modifier.weight(1f),
             style = MaterialTheme.typography.bodySmall,
             fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
-            color = if (ok) Color(0xFF32D74B) else MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (ok) OK_GREEN else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
 
-@Composable
-private fun CommandBox(text: String, ok: Boolean) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1C1C1E)),
-        shape = RoundedCornerShape(8.dp),
-    ) {
-        Text(
-            text = text,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            color = if (ok) Color(0xFF32D74B) else Color(0xFFFF9F0A),
-        )
+/** 真实请求：这是「通道是否可用」的唯一判据。 */
+private fun runTest(baseUrl: String, model: String?, text: String): String {
+    return try {
+        val http = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(180, TimeUnit.SECONDS)
+            .build()
+        val body = JSONObject()
+            .put("model", model ?: "")
+            .put("stream", false)
+            .put(
+                "messages",
+                JSONArray().put(JSONObject().put("role", "user").put("content", text)),
+            )
+        val req = Request.Builder()
+            .url("$baseUrl/chat/completions")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) return "失败 HTTP ${resp.code}\n${raw.take(600)}"
+            val content = runCatching {
+                JSONObject(raw).optJSONArray("choices")
+                    ?.optJSONObject(0)
+                    ?.optJSONObject("message")
+                    ?.optString("content")
+            }.getOrNull()
+            if (content.isNullOrBlank()) "失败：响应里没有内容\n${raw.take(600)}" else content
+        }
+    } catch (e: Exception) {
+        "失败 ${e.javaClass.simpleName}: ${e.message}"
     }
 }
