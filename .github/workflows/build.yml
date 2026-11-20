@@ -39,12 +39,13 @@ jobs:
       # 注意**不能**删 /usr/local/lib/android/sdk/platforms，编译要用。
       - name: Free disk space
         run: |
+          # 只删与 Android 无关的大件。**不要**删 sdk/ndk 或 sdk/system-images：
+          # sdkmanager 的 package.xml 里仍记着它们，删目录会让后续 install 报
+          # "package is corrupt"，反而要花时间修。
           sudo rm -rf /usr/share/dotnet \
                       /usr/local/share/dotnet \
                       /opt/hostedtoolcache/CodeQL \
-                      /usr/share/swift \
-                      /usr/local/lib/android/sdk/ndk \
-                      /usr/local/lib/android/sdk/system-images 2>/dev/null || true
+                      /usr/share/swift 2>/dev/null || true
           sudo apt-get clean
           echo "--- 清理后磁盘 ---"
           df -h /
@@ -68,27 +69,51 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # 不用 android-actions/setup-android@v3：它内部会执行
+      # `sdkmanager --install "tools"`，而 cmdline-tools 16.0 起该包已移除，
+      # 结果是 "Failed to find package 'tools'" + exit 1，整个 job 在装 SDK 阶段就挂。
+      # runner 镜像本来就带 SDK，这里只做路径接线。
+      - name: Configure Android SDK
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          test -d "$SDK_ROOT" || { echo "SDK 目录不存在: $SDK_ROOT"; ls /usr/local/lib/android 2>/dev/null; exit 1; }
+
+          SDKM="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | head -1)"
+          test -n "$SDKM" || { echo "找不到 sdkmanager"; find "$SDK_ROOT/cmdline-tools" -maxdepth 3 | head -20; exit 1; }
+          echo "sdkmanager: $SDKM"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKM")" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
       - name: Install SDK packages
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          export SDK_ROOT="${ANDROID_SDK_ROOT}"
+          SDKM="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager | head -1)"
+
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
           # compileSdk 36 / build-tools 35（AGP 8.7.3 的默认配套）
-          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "platform-tools" "cmake;3.22.1"
+          "$SDKM" --install "platforms;android-36" "build-tools;35.0.0" "platform-tools" "cmake;3.22.1"
 
           # NDK 版本不写死：r28 有小版本迭代，取当前可用列表里最高的 28.x
-          NDK_VER="$(sdkmanager --list 2>/dev/null | grep -oE 'ndk;28\.[0-9]+\.[0-9]+' | cut -d';' -f2 | sort -V | tail -1)"
+          NDK_VER="$("$SDKM" --list 2>/dev/null | grep -oE 'ndk;28\.[0-9]+\.[0-9]+' | cut -d';' -f2 | sort -V | tail -1)"
           if [ -z "$NDK_VER" ]; then
             echo "找不到 NDK 28.x，可用列表："
-            sdkmanager --list 2>/dev/null | grep -E "^\s+ndk;" | head -10
+            "$SDKM" --list 2>/dev/null | grep -E "ndk;" | head -10
             exit 1
           fi
           echo "选用 NDK: $NDK_VER"
-          sdkmanager --install "ndk;$NDK_VER"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          "$SDKM" --install "ndk;$NDK_VER"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+
+          echo "--- 校验 ---"
+          ls -d "$SDK_ROOT/platforms/android-36"
+          ls -d "$SDK_ROOT/ndk/$NDK_VER"
+          df -h /
 
       - name: Set up Go for rclone
         uses: actions/setup-go@v5
