@@ -168,11 +168,38 @@ jobs:
             echo "overlay/ 为空，跳过（当前为基线构建）"
           fi
 
+      # 缓存 Gradle 依赖。每次都是干净 clone，增量编译用不上，
+      # 但 1 GB+ 的依赖下载能省下来（首次约 3 分钟）。
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('upstream/src/android/**/*.gradle.kts', 'upstream/src/android/gradle/libs.versions.toml') }}
+          restore-keys: gradle-
+
       - name: Gradle build
         run: |
           set -euo pipefail
           cd upstream/src/android
           chmod +x gradlew
+
+          # 上游 gradle.properties 是 -Xmx2048m，按 4 核 8 GiB 开发机定的大小。
+          # runner 有 16 GB 却没被用上：1497 个 Kotlin 文件在 2 GB 堆里会报
+          # "GC overhead limit exceeded"，而它裹在 Kotlin 后端的
+          # "Back-end (JVM) Internal error: Couldn't transform method node" 里，
+          # 看上去像源码编译错误，实际纯粹是内存不足。
+          sed -i 's|^org\.gradle\.jvmargs=.*|org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8|' gradle.properties
+          if grep -q '^kotlin\.daemon\.jvmargs=' gradle.properties; then
+            sed -i 's|^kotlin\.daemon\.jvmargs=.*|kotlin.daemon.jvmargs=-Xmx4g|' gradle.properties
+          else
+            echo 'kotlin.daemon.jvmargs=-Xmx4g' >> gradle.properties
+          fi
+          echo "--- 生效的 JVM 参数 ---"
+          grep -E "jvmargs|workers" gradle.properties || true
+          free -h
+
           ./gradlew "$VARIANT" --no-daemon --stacktrace --console=plain
           echo "--- 产物 ---"
           find app/build/outputs -name "*.apk" -exec ls -lh {} \;
