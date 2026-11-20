@@ -160,16 +160,29 @@ jobs:
              src/android/app/provider-customization.properties
 
       # 增量模块覆盖进来。目录结构与 app 模块的包名对齐。
-      # 第一批只验证构建链，本步为空操作（目录不存在时跳过）。
+      # 只做「新增文件」的复制；对已有文件的修改走下一步的定点插入，
+      # 避免整文件覆盖在上游更新时静默丢失改动。
       - name: Overlay extension modules
         run: |
           set -euo pipefail
           if [ -d "overlay" ] && [ -n "$(ls -A overlay)" ]; then
-            echo "覆盖扩展模块："
+            echo "复制新增文件："
             find overlay -type f | sed 's|^|  |'
             cp -rv overlay/. upstream/src/android/app/src/main/
           else
             echo "overlay/ 为空，跳过（当前为基线构建）"
+          fi
+
+      # 定点插入设置入口。锚点对不上就失败退出——宁可构建红，
+      # 也不要产出一个「能装但设置里什么都没有」的包。
+      - name: Patch settings entry
+        run: |
+          set -euo pipefail
+          if [ -f "scripts/apply_overlay.py" ]; then
+            cd upstream
+            python3 "$GITHUB_WORKSPACE/scripts/apply_overlay.py"
+          else
+            echo "无注入脚本，跳过"
           fi
 
       # 缓存 Gradle 依赖。每次都是干净 clone，增量编译用不上，
