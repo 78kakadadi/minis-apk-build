@@ -57,7 +57,10 @@ fun TokenHeatmapScreen(
     var demoLoaded by remember { mutableStateOf(false) }
 
     val buckets = remember(version, range) { heatmap.rangeBuckets(range, today) }
-    val columns = remember(version) { heatmap.columns(today) }
+    // Canvas 只关心每天的 token 数，这里把 DayBucket 投影成 Long，避免 UI 层持有聚合对象
+    val columns = remember(version) {
+        heatmap.columns(today).map { week -> week.map { it.tokens } }
+    }
     val windowTotals = remember(version) { heatmap.window(today) }
     val totalUsage = remember(version) { windowTotals.fold(TokenUsage.ZERO) { a, b -> a + b.usage } }
     val activeDays = remember(version) { windowTotals.count { it.tokens > 0 } }
