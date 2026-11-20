@@ -30,6 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
 
+    # 发布 APK 到 Release 需要写权限
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout build repo
         uses: actions/checkout@v4
@@ -204,16 +208,33 @@ jobs:
           echo "--- 产物 ---"
           find app/build/outputs -name "*.apk" -exec ls -lh {} \;
 
+      # assembleDebug 会同时产出 app-debug.apk 和 github flavor 的同内容副本，
+      # 两个都传会让 artifact 翻倍到 136 MB。只留默认那份。
       - name: Upload APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: minis-apk-${{ github.run_number }}
-          path: |
-            upstream/src/android/app/build/outputs/apk/**/*.apk
-            upstream/src/android/app/build/outputs/mapping/**/*.txt
+          path: upstream/src/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
           retention-days: 14
+
+      # artifact 下载需要登录且走限速 CDN；Release 页面可以直接点下载。
+      # 固定 tag `apk-latest`，每次覆盖同名 asset，避免堆积几十个 release。
+      - name: Publish APK to release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APK=upstream/src/android/app/build/outputs/apk/debug/app-debug.apk
+          ls -lh "$APK"
+          gh release view apk-latest -R "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create apk-latest -R "${{ github.repository }}" \
+              --title "最新构建" \
+              --notes "由 GitHub Actions 自动构建（run #${{ github.run_number }}），基于上游 ${{ github.sha }}。"
+          gh release upload apk-latest "$APK" --clobber -R "${{ github.repository }}"
+          echo "下载地址: https://github.com/${{ github.repository }}/releases/tag/apk-latest"
 
       - name: Upload build logs on failure
         if: failure()
