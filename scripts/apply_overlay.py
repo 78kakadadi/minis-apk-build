@@ -109,7 +109,133 @@ def main() -> None:
         "composable(Routes.FREE_TOKEN)",
     )
 
-    # 6) build.gradle.kts：禁止 AGP 对 libopencode.so 做 strip。
+    # 6) SettingsScreen：扩展能力区块的 5 个回调参数
+    patch(
+        settings,
+        "    onFreeTokenClick: () -> Unit = {},\n) {",
+        "    onFreeTokenClick: () -> Unit = {},\n"
+        "    // 扩展能力（热力图 / Key 池 / 群聊 / 插件 / 派发）\n"
+        "    onHeatmapClick: () -> Unit = {},\n"
+        "    onKeyPoolClick: () -> Unit = {},\n"
+        "    onGroupChatClick: () -> Unit = {},\n"
+        "    onPluginClick: () -> Unit = {},\n"
+        "    onDispatchClick: () -> Unit = {},\n) {",
+        "扩展能力回调参数",
+        "onHeatmapClick: () -> Unit = {}",
+    )
+
+    # 7) SettingsScreen：扩展能力区块（插在 Appearance 之前）
+    patch(
+        settings,
+        "            // -- Appearance --\n",
+        '            // -- 扩展能力 --\n'
+        '            SettingsSection(title = "扩展能力") {\n'
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.BarChart,\n"
+        "                    iconColor = Color(0xFF30A14E),\n"
+        '                    title = "Token 使用热力图",\n'
+        '                    subtitle = "近 26 周用量分布与按模型明细",\n'
+        "                    onClick = onHeatmapClick,\n"
+        "                )\n"
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.Shield,\n"
+        "                    iconColor = Color(0xFF5856D6),\n"
+        '                    title = "API Key 池",\n'
+        '                    subtitle = "多 Key 加权轮询与差异化冷却",\n'
+        "                    onClick = onKeyPoolClick,\n"
+        "                )\n"
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.Groups,\n"
+        "                    iconColor = Color(0xFFFF9F0A),\n"
+        '                    title = "群聊编排",\n'
+        '                    subtitle = "多成员调度与消息引用定向回复",\n'
+        "                    onClick = onGroupChatClick,\n"
+        "                )\n"
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.Extension,\n"
+        "                    iconColor = Color(0xFF007AFF),\n"
+        '                    title = "插件",\n'
+        '                    subtitle = "清单校验、包路径防护与可撤销插槽",\n'
+        "                    onClick = onPluginClick,\n"
+        "                )\n"
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.Dashboard,\n"
+        "                    iconColor = Color(0xFFFF453A),\n"
+        '                    title = "多 Agent 派发",\n'
+        '                    subtitle = "授权令牌校验与波次去重",\n'
+        "                    onClick = onDispatchClick,\n"
+        "                    showDivider = false,\n"
+        "                )\n"
+        "            }\n"
+        "\n"
+        "            // -- Appearance --\n",
+        "扩展能力区块",
+        'SettingsSection(title = "扩展能力")',
+    )
+
+    # 8) AppNavigation：5 个路由常量
+    patch(
+        nav,
+        '    const val FREE_TOKEN = "free_token"',
+        '    const val FREE_TOKEN = "free_token"\n'
+        '    const val HEATMAP = "token_heatmap"\n'
+        '    const val KEY_POOL = "api_key_pool"\n'
+        '    const val GROUP_CHAT = "group_chat"\n'
+        '    const val PLUGINS = "plugins"\n'
+        '    const val DISPATCH = "agent_dispatch"',
+        "扩展能力路由常量",
+        'const val HEATMAP = "token_heatmap"',
+    )
+
+    # 9) AppNavigation：把 5 个回调接到导航
+    patch(
+        nav,
+        "                onFreeTokenClick = { navController.safeNavigate(Routes.FREE_TOKEN) },\n",
+        "                onFreeTokenClick = { navController.safeNavigate(Routes.FREE_TOKEN) },\n"
+        "                onHeatmapClick = { navController.safeNavigate(Routes.HEATMAP) },\n"
+        "                onKeyPoolClick = { navController.safeNavigate(Routes.KEY_POOL) },\n"
+        "                onGroupChatClick = { navController.safeNavigate(Routes.GROUP_CHAT) },\n"
+        "                onPluginClick = { navController.safeNavigate(Routes.PLUGINS) },\n"
+        "                onDispatchClick = { navController.safeNavigate(Routes.DISPATCH) },\n",
+        "扩展能力导航回调",
+        "onHeatmapClick = { navController.safeNavigate(Routes.HEATMAP) }",
+    )
+
+    # 10) AppNavigation：注册 5 个目标页面
+    patch(
+        nav,
+        "        composable(Routes.BACKUP) { entry ->",
+        "        composable(Routes.HEATMAP) {\n"
+        "            com.openminis.app.ui.opencode.TokenHeatmapScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.KEY_POOL) {\n"
+        "            com.openminis.app.ui.opencode.ApiKeyPoolScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.GROUP_CHAT) {\n"
+        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.PLUGINS) {\n"
+        "            com.openminis.app.ui.opencode.PluginScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.DISPATCH) {\n"
+        "            com.openminis.app.ui.opencode.DispatchScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.BACKUP) { entry ->",
+        "扩展能力页面注册",
+        "composable(Routes.HEATMAP)",
+    )
+
+    # 11) build.gradle.kts：禁止 AGP 对 libopencode.so 做 strip。
     #    它是 199 MB 的 Bun 单文件二进制，strip 既慢又可能破坏运行时元数据；
     #    而它本来就没有可剥离的调试符号需要归档。
     patch(
