@@ -77,7 +77,14 @@ private val GC_RED = Color(0xFFFF453A)
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun GroupChatScreen(onBack: () -> Unit) {
+fun GroupChatScreen(
+    onBack: () -> Unit,
+    /**
+     * 从会话列表长按入口进来时带上群 id，直接进群，不再让用户在建群 / 选群列表里
+     * 再点一次。群里找不到这个 id（比如刚被删）时自然回落到群列表。
+     */
+    initialGroupId: String? = null,
+) {
     val context = LocalContext.current
     val store = remember { GroupStore(context) }
     val personas = remember { PersonaRepository(PersonaFileStore(context)) }
@@ -93,10 +100,17 @@ fun GroupChatScreen(onBack: () -> Unit) {
     val engine = remember { GroupChatEngine(store, personas, { manager.bridgeBaseUrl }, http) }
 
     var groups by remember { mutableStateOf(store.groups()) }
-    var currentId by remember { mutableStateOf<String?>(null) }
+    var currentId by remember { mutableStateOf(initialGroupId) }
     var newGroupName by remember { mutableStateOf("") }
-    var members by remember { mutableStateOf(emptyList<com.openminis.app.ext.group.GroupMemberDef>()) }
-    var messages by remember { mutableStateOf(emptyList<GroupMessage>()) }
+    var members by remember {
+        mutableStateOf(
+            initialGroupId?.let { store.members(it) }
+                ?: emptyList<com.openminis.app.ext.group.GroupMemberDef>(),
+        )
+    }
+    var messages by remember {
+        mutableStateOf(initialGroupId?.let { store.messages(it) } ?: emptyList<GroupMessage>())
+    }
 
     var showAddMember by remember { mutableStateOf(false) }
     var pickedPersonaId by remember { mutableStateOf<String?>(null) }

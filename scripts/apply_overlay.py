@@ -319,6 +319,222 @@ def main() -> None:
         "composable(Routes.PERSONAS)",
     )
 
+    # ======================================================================
+    # 长按「新对话」按钮 → 群聊
+    #
+    # 上游这个长按手势原本弹的是「模型组」下拉（把新会话归到某个模型组），
+    # 跟用户理解的「群聊」完全不是一回事。这里把它换成群聊入口：新建群 /
+    # 进入已有群，并跳转到群聊页。
+    # ======================================================================
+    sessions = ROOT / "ui/sessions/SessionListScreen.kt"
+    split = ROOT / "ui/navigation/ChatSplitScaffold.kt"
+    onboarding = ROOT / "ui/onboarding/OnboardingScreen.kt"
+
+    for f in (sessions, split, onboarding):
+        if not f.exists():
+            print(f"  [FAIL] 找不到 {f}", file=sys.stderr)
+            sys.exit(1)
+
+    # 17) 会话列表：新增回调参数
+    patch(
+        sessions,
+        "    draftPlaceholderId: String? = null,\n) {",
+        "    draftPlaceholderId: String? = null,\n"
+        "    // 群聊入口（长按新对话按钮）：参数是群 id，null 表示只打开群列表\n"
+        "    onGroupChatClick: (String?) -> Unit = {},\n) {",
+        "会话列表群聊回调参数",
+        "// 群聊入口（长按新对话按钮）",
+    )
+
+    # 18) 会话列表：把回调传给底部按钮行
+    patch(
+        sessions,
+        "                    modelGroups = providerConfig.modelGroups,\n"
+        "                    onSearchToggle = {",
+        "                    modelGroups = providerConfig.modelGroups,\n"
+        "                    onGroupChatClick = onGroupChatClick,\n"
+        "                    onSearchToggle = {",
+        "底部按钮行传参",
+        "onGroupChatClick = onGroupChatClick,",
+    )
+
+    # 19) DualFabRow：新增参数
+    patch(
+        sessions,
+        "    onNewChat: () -> Unit,\n"
+        "    onNewChatWithGroup: (String) -> Unit,\n",
+        "    onNewChat: () -> Unit,\n"
+        "    onNewChatWithGroup: (String) -> Unit,\n"
+        "    // 群聊入口：长按新对话按钮 → 群聊\n"
+        "    onGroupChatClick: (String?) -> Unit,\n",
+        "DualFabRow 群聊参数",
+        "// 群聊入口：长按新对话按钮 → 群聊",
+    )
+
+    # 20) 长按不再受「有没有模型组」限制：没有模型组也应该能建群
+    patch(
+        sessions,
+        "                    .combinedClickable(\n"
+        "                        onClick = onNewChat,\n"
+        "                        onLongClick = {\n"
+        "                            if (topGroups.isNotEmpty()) showGroupMenu = true\n"
+        "                        },\n"
+        "                    ),",
+        "                    .combinedClickable(\n"
+        "                        onClick = onNewChat,\n"
+        "                        onLongClick = { showGroupMenu = true },\n"
+        "                    ),",
+        "长按手势无条件生效",
+        "onLongClick = { showGroupMenu = true },",
+    )
+
+    # 21) 下拉菜单 → 群聊弹层
+    patch(
+        sessions,
+        "            DropdownMenu(\n"
+        "                expanded = showGroupMenu,\n"
+        "                onDismissRequest = { showGroupMenu = false },\n"
+        "            ) {\n"
+        "                topGroups.forEach { group ->\n"
+        "                    DropdownMenuItem(\n"
+        "                        text = { Text(group.name) },\n"
+        "                        leadingIcon = { Icon(Icons.Outlined.Forum, contentDescription = null) },\n"
+        "                        onClick = {\n"
+        "                            showGroupMenu = false\n"
+        "                            onNewChatWithGroup(group.id)\n"
+        "                        },\n"
+        "                    )\n"
+        "                }\n"
+        "            }",
+        "            com.openminis.app.ui.opencode.GroupChatFabMenu(\n"
+        "                expanded = showGroupMenu,\n"
+        "                onDismiss = { showGroupMenu = false },\n"
+        "                onOpen = { groupId ->\n"
+        "                    showGroupMenu = false\n"
+        "                    onGroupChatClick(groupId)\n"
+        "                },\n"
+        "            )",
+        "长按弹层改为群聊",
+        "com.openminis.app.ui.opencode.GroupChatFabMenu(",
+    )
+
+    # 22) 在按钮行上方插入一次性提示条（Column 包裹）
+    patch(
+        sessions,
+        "    Row(\n"
+        "        modifier = modifier\n"
+        "            .fillMaxWidth()\n"
+        "            // T24: lift the FAB+search row above the IME so the text field\n"
+        "            // remains visible while typing. Compose-managed inset — handles\n"
+        "            // the IME open/close animation in lockstep.\n"
+        "            .imePadding()\n"
+        "            .padding(horizontal = 16.dp, vertical = 20.dp),",
+        "    Column(modifier = modifier) {\n"
+        "    // 首次进入时的「长按建群」提示，只出现一次\n"
+        "    com.openminis.app.ui.opencode.GroupChatFabHint()\n"
+        "    Row(\n"
+        "        modifier = Modifier\n"
+        "            .fillMaxWidth()\n"
+        "            // T24: lift the FAB+search row above the IME so the text field\n"
+        "            // remains visible while typing. Compose-managed inset — handles\n"
+        "            // the IME open/close animation in lockstep.\n"
+        "            .imePadding()\n"
+        "            .padding(horizontal = 16.dp, vertical = 20.dp),",
+        "提示条插入",
+        "com.openminis.app.ui.opencode.GroupChatFabHint()",
+    )
+
+    # 23) 关闭上面新开的 Column
+    patch(
+        sessions,
+        "        if (isSwapped) { chatFab() } else { searchFab() }\n"
+        "    }\n"
+        "}",
+        "        if (isSwapped) { chatFab() } else { searchFab() }\n"
+        "    }\n"
+        "    // [/group-chat-fab-hint]\n"
+        "    }\n"
+        "}",
+        "提示条 Column 收尾",
+        "[/group-chat-fab-hint]",
+    )
+
+    # 24) 分屏脚手架：把群聊回调接到导航
+    patch(
+        split,
+        "                onNetworkPageClick = { route -> navController.safeNavigate(route) },\n"
+        "                selectedSessionId = selectedSessionId,",
+        "                onNetworkPageClick = { route -> navController.safeNavigate(route) },\n"
+        "                onGroupChatClick = { groupId ->\n"
+        "                    if (groupId == null) navController.safeNavigate(Routes.GROUP_CHAT)\n"
+        "                    else navController.safeNavigate(Routes.groupChatWith(groupId))\n"
+        "                },\n"
+        "                selectedSessionId = selectedSessionId,",
+        "会话列表群聊导航",
+        "Routes.groupChatWith(groupId)",
+    )
+
+    # 25) 路由：带群 id 的群聊
+    patch(
+        nav,
+        '    const val PERSONAS = "personas"',
+        '    const val PERSONAS = "personas"\n'
+        "\n"
+        "    /** 群聊直达：带群 id 打开（长按新对话按钮后进来）。 */\n"
+        '    const val GROUP_CHAT_ONE = "group_chat/{groupId}"\n'
+        "\n"
+        '    fun groupChatWith(groupId: String): String = "group_chat/" + android.net.Uri.encode(groupId)',
+        "群聊直达路由",
+        'const val GROUP_CHAT_ONE = "group_chat/{groupId}"',
+    )
+
+    # 26) 注册带群 id 的群聊页面
+    patch(
+        nav,
+        "        composable(Routes.GROUP_CHAT) {\n"
+        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }",
+        "        composable(Routes.GROUP_CHAT) {\n"
+        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n"
+        "\n"
+        "        composable(\n"
+        "            route = Routes.GROUP_CHAT_ONE,\n"
+        "            arguments = listOf(navArgument(\"groupId\") { type = NavType.StringType }),\n"
+        "        ) { entry ->\n"
+        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "                initialGroupId = entry.arguments?.getString(\"groupId\"),\n"
+        "            )\n"
+        "        }",
+        "群聊直达页面注册",
+        "Routes.GROUP_CHAT_ONE",
+    )
+
+    # 27) 新手引导：模型选择之后加一页「长按建群」
+    patch(
+        onboarding,
+        "        2 -> ModelSelectionStep(providerRepository = providerRepository, onComplete = onComplete)",
+        "        2 -> ModelSelectionStep(providerRepository = providerRepository, onComplete = { step = 3 })\n"
+        "        // 长按新对话按钮 → 群聊，作为引导的最后一页\n"
+        "        3 -> com.openminis.app.ui.opencode.OnboardingGroupChatStep(onComplete = onComplete)",
+        "引导页新增群聊步骤",
+        "OnboardingGroupChatStep(onComplete = onComplete)",
+    )
+
+    # 27b) 跳过 API Key 时也走到群聊引导，不要在最后一页前就结束
+    patch(
+        onboarding,
+        "onNext = { step = 2 }, onSkip = onComplete)",
+        "onNext = { step = 2 }, onSkip = { step = 3 })",
+        "跳过 API Key 也看群聊引导",
+        "onSkip = { step = 3 })",
+    )
+
     print("注入完成。")
 
 if __name__ == "__main__":
