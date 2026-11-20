@@ -247,7 +247,9 @@ class FreeTokenManager private constructor(context: Context) {
         val repo = ProviderRepository(app)
         // 仓库是异步加载配置的：不先等它读完，instances 会是空列表，
         // 于是每次启动都当成"首次注册"，堆出一串同 id 的实例。
-        runBlocking { runCatching { repo.awaitConfigLoaded() } }
+        // awaitConfigLoaded 是挂起函数，runCatching 的 lambda 不是挂起上下文，
+        // 只能直接用 try/catch
+        runBlocking { try { repo.awaitConfigLoaded() } catch (e: Exception) { /* 读不到就按空配置继续 */ } }
         val id = store.providerInstanceId ?: INSTANCE_ID
 
         val existing = repo.instances.firstOrNull { it.id == id }

@@ -8,7 +8,6 @@ import com.openminis.app.ext.opencode.sse.PartDeltaTracker
 import com.openminis.app.ext.opencode.stream.OpencodeChunkMapper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType

@@ -143,7 +143,9 @@ class GroupChatEngine(
 
             onEvent(GroupEvent.MemberStarted(member.id, name))
             val reply = StringBuilder()
-            val failure = runCatching {
+            // 不能用 runCatching：它的 block 是普通 lambda，里面调不了挂起函数
+            var failure: Throwable? = null
+            try {
                 streamMember(
                     base = base,
                     persona = persona,
@@ -151,12 +153,15 @@ class GroupChatEngine(
                     history = history,
                     userText = text,
                     quote = quote,
-                    onDelta = { chunk ->
-                        reply.append(chunk)
-                        onEvent(GroupEvent.MemberDelta(member.id, chunk))
-                    },
-                )
-            }.exceptionOrNull()
+                ) { chunk ->
+                    reply.append(chunk)
+                    onEvent(GroupEvent.MemberDelta(member.id, chunk))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failure = e
+            }
 
             if (failure != null) {
                 onEvent(GroupEvent.MemberFailed(member.id, name, failure.message ?: "调用失败"))
