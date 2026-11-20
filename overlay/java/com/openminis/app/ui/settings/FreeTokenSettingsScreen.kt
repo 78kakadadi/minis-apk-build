@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -24,7 +25,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -36,15 +41,22 @@ import androidx.compose.ui.unit.sp
 import com.openminis.app.ext.opencode.policy.FreeTierTool
 import com.openminis.app.ext.opencode.policy.ShellCommandBuilder
 import com.openminis.app.ext.opencode.runtime.OpencodeLayout
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.concurrent.TimeUnit
 
 /**
  * 免费 Token 通道（内嵌 OpenCode）设置页。
  *
- * 这一页刻意不依赖任何网络或子进程：它把「通道要用的真实规则」直接算出来给用户看，
- * 包括运行时目录的真实落点、上游硬性要求的四个工具名与 Minis 的映射、以及命令拼装结果。
+ * 本页三件事：
+ * 1. 展示运行时目录的真实落点（不创建，只查）；
+ * 2. 展示上游硬性要求的四个工具名与 Minis 实际工具名的映射——这是 403 的根因；
+ * 3. 「运行自检」直接 execve nativeLibraryDir/libopencode.so，验证它真的可执行。
  *
- * 之所以先做「只读自检」而不是「一键启动」：启动链路依赖 libopencode.so，
- * 而该二进制是否随包分发取决于打包产物，先把不依赖二进制的部分做成可见、可验证的。
+ * 第 3 点是整条通道的地基：Android 10+ 只允许从 nativeLibraryDir 执行二进制，
+ * 这一步若报 Permission denied，后面的 serve / SSE / 模型调用全都不成立。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -52,22 +64,30 @@ fun FreeTokenSettingsScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
-    // 真实计算：运行时目录布局（file 对象，不创建）
     val layout = remember { OpencodeLayout(context.filesDir) }
     val configExists = remember { layout.configFile.exists() }
     val serviceExists = remember { layout.serviceFile.exists() }
 
-    // 真实计算：上游要求的四个工具名 → Minis 实际工具名
-    val toolRows = remember { FreeTierTool.ALL }
+    // 规格要求的唯一合法可执行目录
+    val elf = remember {
+        File(context.applicationInfo.nativeLibraryDir, "libopencode.so")
+    }
+    val elfPresent = remember { elf.exists() }
+    val elfExecutable = remember { elf.canExecute() }
 
-    // 真实计算：命令拼装样例（这条命令是 grep 的最终形态）
+    val toolRows = remember { FreeTierTool.ALL }
     val sampleGrep = remember {
         ShellCommandBuilder.grep("TODO", path = "src", include = "kt", limit = 20)
     }
     val sampleGlob = remember {
         ShellCommandBuilder.glob("**/*.kt", path = "app")
     }
+
+    var probing by remember { mutableStateOf(false) }
+    var probeResult by remember { mutableStateOf<String?>(null) }
+    var probeOk by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -92,7 +112,7 @@ fun FreeTokenSettingsScreen(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            // ---------- 状态 ----------
+            // ---------- 原生二进制 ----------
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -105,18 +125,85 @@ fun FreeTokenSettingsScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Text(
-                        text = "通道状态",
+                        text = "原生二进制",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    StatusLine("运行时根目录", layout.root.absolutePath, true)
-                    StatusLine("配置文件", if (configExists) "已生成" else "未生成", configExists)
-                    StatusLine("服务身份", if (serviceExists) "已注册" else "未注册", serviceExists)
-                    StatusLine("原生二进制", "未随包分发", false)
+                    StatusLine(
+                        label = "文件存在",
+                        value = if (elfPresent) "是" else "否（未打进安装包）",
+                        ok = elfPresent,
+                    )
+                    StatusLine(
+                        label = "可执行位",
+                        value = if (elfExecutable) "已就绪" else "无执行权限",
+                        ok = elfExecutable,
+                    )
+                    StatusLine(
+                        label = "路径",
+                        value = elf.absolutePath,
+                        ok = false,
+                        mono = true,
+                    )
+
+                    Spacer(Modifier.height(4.dp))
+                    Button(
+                        onClick = {
+                            probing = true
+                            probeResult = null
+                            scope.launch {
+                                val (ok, text) = withContext(Dispatchers.IO) {
+                                    probeElf(elf)
+                                }
+                                probeOk = ok
+                                probeResult = text
+                                probing = false
+                            }
+                        },
+                        enabled = !probing && elfPresent,
+                    ) {
+                        Text(if (probing) "检测中…" else "运行自检")
+                    }
+
+                    probeResult?.let { text ->
+                        Spacer(Modifier.height(6.dp))
+                        CommandBox(text, ok = probeOk)
+                    }
                 }
             }
 
-            // ---------- 为什么需要别名 ----------
+            // ---------- 运行时目录 ----------
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "运行时目录",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    StatusLine(label = "根目录", value = layout.root.absolutePath, ok = false, mono = true)
+                    StatusLine(
+                        label = "配置文件",
+                        value = if (configExists) "已生成" else "未生成",
+                        ok = configExists,
+                    )
+                    StatusLine(
+                        label = "服务身份",
+                        value = if (serviceExists) "已注册" else "未注册",
+                        ok = serviceExists,
+                    )
+                }
+            }
+
+            // ---------- 工具名映射 ----------
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -198,47 +285,60 @@ fun FreeTokenSettingsScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.height(10.dp))
-                    CommandBox(sampleGlob)
+                    CommandBox(sampleGlob, ok = true)
                     Spacer(Modifier.height(6.dp))
-                    CommandBox(sampleGrep)
+                    CommandBox(sampleGrep, ok = true)
                 }
             }
-
-            // ---------- 说明 ----------
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "当前进度",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    BulletLine("已完成", "SSE 解析、事件映射、用量台账、重连策略、进程管理、配置生成、Key 池调度、人设与记忆、插件校验 —— 共 159 个单元测试通过")
-                    BulletLine("已完成", "本页展示的映射与命令拼装均为真实计算结果，非占位文本")
-                    BulletLine("待完成", "原生二进制分发与 Provider 接入（需要在真机构建中验证 libopencode.so 可执行）")
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
         }
     }
 }
 
+/**
+ * 执行 `libopencode.so --version`。
+ *
+ * 用绝对路径直接 execve，不经 shell——只有这样才能验证「二进制本身可执行」，
+ * 而不是「bash 能跑」。这正是规格 §308 的判定条件。
+ */
+private fun probeElf(elf: File): Pair<Boolean, String> {
+    if (!elf.exists()) return false to "文件不存在：${elf.absolutePath}"
+    if (!elf.canExecute()) return false to "缺少执行权限：${elf.absolutePath}"
+    return try {
+        val process = ProcessBuilder(elf.absolutePath, "--version")
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        val finished = process.waitFor(25, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            return false to "执行超时（25 秒未返回）"
+        }
+        val code = process.exitValue()
+        val trimmed = output.trim().take(500)
+        if (code == 0 && trimmed.isNotEmpty()) {
+            true to "exit=0\n$trimmed"
+        } else {
+            false to "exit=$code\n$trimmed"
+        }
+    } catch (e: Exception) {
+        false to "启动失败：${e.javaClass.simpleName}: ${e.message}"
+    }
+}
+
 @Composable
-private fun StatusLine(label: String, value: String, ok: Boolean) {
+private fun StatusLine(
+    label: String,
+    value: String,
+    ok: Boolean,
+    mono: Boolean = false,
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.Top,
     ) {
         Text(
             text = label,
-            modifier = Modifier.width(88.dp),
+            modifier = Modifier.width(76.dp),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -246,51 +346,27 @@ private fun StatusLine(label: String, value: String, ok: Boolean) {
             text = value,
             modifier = Modifier.weight(1f),
             style = MaterialTheme.typography.bodySmall,
-            fontFamily = if (ok) FontFamily.Default else FontFamily.Monospace,
-            color = if (ok) {
-                MaterialTheme.colorScheme.onSurface
-            } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            },
+            fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+            color = if (ok) Color(0xFF32D74B) else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
 
 @Composable
-private fun CommandBox(command: String) {
+private fun CommandBox(text: String, ok: Boolean) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF1C1C1E)),
         shape = RoundedCornerShape(8.dp),
     ) {
         Text(
-            text = command,
+            text = text,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 10.dp, vertical = 8.dp),
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
-            color = Color(0xFF32D74B),
-        )
-    }
-}
-
-@Composable
-private fun BulletLine(tag: String, text: String) {
-    val tint = if (tag == "已完成") Color(0xFF32D74B) else Color(0xFFFF9F0A)
-    Row(modifier = Modifier.padding(vertical = 3.dp)) {
-        Text(
-            text = tag,
-            modifier = Modifier.width(56.dp),
-            style = MaterialTheme.typography.labelSmall,
-            color = tint,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Text(
-            text = text,
-            modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (ok) Color(0xFF32D74B) else Color(0xFFFF9F0A),
         )
     }
 }

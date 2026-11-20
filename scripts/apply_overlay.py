@@ -10,6 +10,7 @@ import sys
 import pathlib
 
 ROOT = pathlib.Path("src/android/app/src/main/java/com/openminis/app")
+GRADLE = pathlib.Path("src/android/app/build.gradle.kts")
 
 
 def patch(path: pathlib.Path, old: str, new: str, label: str, marker: str) -> None:
@@ -108,8 +109,25 @@ def main() -> None:
         "composable(Routes.FREE_TOKEN)",
     )
 
-    print("注入完成。")
+    # 6) build.gradle.kts：禁止 AGP 对 libopencode.so 做 strip。
+    #    它是 199 MB 的 Bun 单文件二进制，strip 既慢又可能破坏运行时元数据；
+    #    而它本来就没有可剥离的调试符号需要归档。
+    patch(
+        GRADLE,
+        "    compileSdk = 36\n",        "    compileSdk = 36\n"
+        "\n"
+        "    // libopencode.so 是自包含的 Bun + OpenCode 单文件二进制，\n"
+        "    // 不能被 NDK strip：既没有可剥离符号，strip 还可能破坏运行时元数据。\n"
+        "    packaging {\n"
+        "        jniLibs {\n"
+        '            keepDebugSymbols += "**/libopencode.so"\n'
+        "        }\n"
+        "    }\n",
+        "build.gradle.kts 禁止 strip",
+        'keepDebugSymbols += "**/libopencode.so"',
+    )
 
+    print("注入完成。")
 
 if __name__ == "__main__":
     main()

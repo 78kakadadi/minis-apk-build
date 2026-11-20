@@ -159,6 +159,23 @@ jobs:
           cp src/android/app/provider-customization.properties.example \
              src/android/app/provider-customization.properties
 
+      # 免费 Token 通道的 native 二进制。
+      # 放进 jniLibs 而不是 assets：上游 Manifest 已声明 extractNativeLibs="true"，
+      # AGP 会把它解压到 nativeLibraryDir，那里是 Android 唯一允许应用 execve 的目录。
+      # 校验 ELF 结构，防止上游换成脚本包装或错架构。
+      - name: Fetch OpenCode native ELF
+        run: |
+          set -euo pipefail
+          OUT=upstream/src/android/app/src/main/jniLibs/arm64-v8a/libopencode.so
+          URL="https://github.com/bd-loser/opencode-bionic/releases/download/v2.3.2/opencode"
+          echo "下载 $URL"
+          curl -fL --retry 4 --retry-delay 3 -o "$OUT" "$URL"
+          chmod +x "$OUT"
+          python3 scripts/verify_elf.py "$OUT"
+          echo "--- sha256（锁定版本用） ---"
+          sha256sum "$OUT"
+          ls -lh "$OUT"
+
       # 增量模块覆盖进来。目录结构与 app 模块的包名对齐。
       # 只做「新增文件」的复制；对已有文件的修改走下一步的定点插入，
       # 避免整文件覆盖在上游更新时静默丢失改动。
@@ -247,6 +264,9 @@ jobs:
               --title "最新构建" \
               --notes "由 GitHub Actions 自动构建（run #${{ github.run_number }}），基于上游 ${{ github.sha }}。"
           gh release upload apk-latest "$APK" --clobber -R "${{ github.repository }}"
+          # 固定 tag 会覆盖 asset，若不同步更新说明，页面上永远显示首次构建的信息
+          gh release edit apk-latest -R "${{ github.repository }}" \
+            --notes "构建 #${{ github.run_number }}（$(date -u '+%Y-%m-%d %H:%M UTC')），基于上游 ${{ github.sha }}。功能入口：设置 › 免费 Token 通道。"
           echo "下载地址: https://github.com/${{ github.repository }}/releases/tag/apk-latest"
 
       - name: Upload build logs on failure
