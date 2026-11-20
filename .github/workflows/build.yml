@@ -1,0 +1,175 @@
+name: build-apk
+
+# 目标：在 GitHub Actions 上把 OpenMinis 完整编译成可安装 APK。
+# 本仓库**不存** Minis 源码（1497 个文件 + 二进制约 200MB），
+# 每次构建现场从上游 clone，再把本仓库的增量模块覆盖进去。
+# 这样既不用推大文件，也保证基线永远是最新上游。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Gradle 构建变体"
+        required: false
+        default: assembleDebug
+        type: choice
+        options: [assembleDebug, assembleRelease]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/openminis/openminis.git
+  VARIANT: ${{ inputs.variant || 'assembleDebug' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      # Ubuntu runner 只有约 14GB 空闲，而 SDK + NDK + Gradle 缓存 + 三份 native
+      # 构建产物会超过 20GB。这里删掉 runner 预装但本项目用不到的东西。
+      # 注意**不能**删 /usr/local/lib/android/sdk/platforms，编译要用。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/share/dotnet \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift \
+                      /usr/local/lib/android/sdk/ndk \
+                      /usr/local/lib/android/sdk/system-images 2>/dev/null || true
+          sudo apt-get clean
+          echo "--- 清理后磁盘 ---"
+          df -h /
+
+      - name: Checkout upstream OpenMinis
+        run: |
+          set -euo pipefail
+          # --recurse-submodules 是关键：deps/proot 和 deps/ish 是 submodule，
+          # 缺了它们 build_proot.sh 会直接失败（tarball 下载拿到的就是空目录）。
+          git clone --depth=1 --recurse-submodules "$UPSTREAM_REPO" upstream
+          cd upstream
+          echo "--- submodule 状态 ---"
+          git submodule status
+          echo "--- 关键目录是否非空 ---"
+          test -n "$(ls -A deps/proot)" || { echo "deps/proot 为空，submodule 未拉取"; exit 1; }
+          test -n "$(ls -A deps/rclone-mobile)" || { echo "deps/rclone-mobile 缺失"; exit 1; }
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # compileSdk 36 / build-tools 35（AGP 8.7.3 的默认配套）
+          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "platform-tools" "cmake;3.22.1"
+
+          # NDK 版本不写死：r28 有小版本迭代，取当前可用列表里最高的 28.x
+          NDK_VER="$(sdkmanager --list 2>/dev/null | grep -oE 'ndk;28\.[0-9]+\.[0-9]+' | cut -d';' -f2 | sort -V | tail -1)"
+          if [ -z "$NDK_VER" ]; then
+            echo "找不到 NDK 28.x，可用列表："
+            sdkmanager --list 2>/dev/null | grep -E "^\s+ndk;" | head -10
+            exit 1
+          fi
+          echo "选用 NDK: $NDK_VER"
+          sdkmanager --install "ndk;$NDK_VER"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+
+      - name: Set up Go for rclone
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+
+      # rclone.aar 是 app 模块的 compileOnly 依赖（implementation(name="rclone")），
+      # 上游不提交二进制，必须现场用 gomobile 编。这一步最慢（rclone 后端很多）。
+      - name: Build rclone.aar
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          cd upstream
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/
+          ls -lh src/android/app/libs/rclone.aar
+
+      # proot 交叉编译 + Alpine rootfs，缺一个沙箱就起不来
+      - name: Build proot and Alpine rootfs
+        run: |
+          set -euo pipefail
+          cd upstream
+          ./deps/build_proot.sh
+          ./scripts/prepare_android_sandbox.sh
+          echo "--- 产物 ---"
+          ls -lh src/android/app/src/main/assets/proot-aarch64
+          ls -lh src/android/app/src/main/assets/alpine-minirootfs.tar.gz
+          ls -lh src/android/app/src/main/jniLibs/arm64-v8a/
+
+      # build-time 注入值，留空可编译可运行（BUILDING.md 明确说明）
+      - name: Apply provider customization template
+        run: |
+          set -euo pipefail
+          cd upstream
+          cp src/android/app/provider-customization.properties.example \
+             src/android/app/provider-customization.properties
+
+      # 增量模块覆盖进来。目录结构与 app 模块的包名对齐。
+      # 第一批只验证构建链，本步为空操作（目录不存在时跳过）。
+      - name: Overlay extension modules
+        run: |
+          set -euo pipefail
+          if [ -d "overlay" ] && [ -n "$(ls -A overlay)" ]; then
+            echo "覆盖扩展模块："
+            find overlay -type f | sed 's|^|  |'
+            cp -rv overlay/. upstream/src/android/app/src/main/
+          else
+            echo "overlay/ 为空，跳过（当前为基线构建）"
+          fi
+
+      - name: Gradle build
+        run: |
+          set -euo pipefail
+          cd upstream/src/android
+          chmod +x gradlew
+          ./gradlew "$VARIANT" --no-daemon --stacktrace --console=plain
+          echo "--- 产物 ---"
+          find app/build/outputs -name "*.apk" -exec ls -lh {} \;
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minis-apk-${{ github.run_number }}
+          path: |
+            upstream/src/android/app/build/outputs/apk/**/*.apk
+            upstream/src/android/app/build/outputs/mapping/**/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            upstream/src/android/**/build/reports/**
+            upstream/src/android/*.log
+          if-no-files-found: ignore
+          retention-days: 7
