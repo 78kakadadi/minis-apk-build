@@ -189,6 +189,9 @@ fun GroupChatScreen(
     var pending by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var thinking by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var status by remember { mutableStateOf("") }
+    // 每一轮发送一个编号：旧任务的 finally 只能清理自己那一轮的状态。
+    // 否则「停止后立刻再发一条」时，上一轮的收尾会把新一轮的流式气泡一起清掉。
+    var runToken by remember { mutableStateOf(0) }
     var quote by remember { mutableStateOf<GroupMessage?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var newGroupName by remember { mutableStateOf("") }
@@ -446,6 +449,8 @@ fun GroupChatScreen(
                         thinking = emptyMap()
                         val q = quote
                         quote = null
+                        runToken++
+                        val myToken = runToken
                         GroupChatJobs.launch(sendGroupId) {
                             try {
                                 engine.send(sendGroupId, text, q, files, handleEvent)
@@ -461,9 +466,11 @@ fun GroupChatScreen(
                                 // 被「停止」取消时 withContext 本身会立刻抛，必须 NonCancellable，
                                 // 否则清理逻辑不会执行。
                                 withContext(NonCancellable + Dispatchers.Main) {
-                                    pending = emptyMap()
-                                    thinking = emptyMap()
-                                    version++
+                                    if (myToken == runToken) {
+                                        pending = emptyMap()
+                                        thinking = emptyMap()
+                                        version++
+                                    }
                                 }
                             }
                         }
