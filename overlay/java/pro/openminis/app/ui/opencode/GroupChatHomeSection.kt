@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -125,7 +126,7 @@ fun GroupChatHomeSection(
                             val spec = AiAvatars.resolve(m)
                             Box(
                                 modifier = Modifier
-                                    .padding(start = if (index == 0) 0.dp else (-8).dp)
+                                    .offset(x = if (index == 0) 0.dp else (-8).dp)
                                     .size(30.dp)
                                     .clip(CircleShape)
                                     .background(Color(spec.color)),

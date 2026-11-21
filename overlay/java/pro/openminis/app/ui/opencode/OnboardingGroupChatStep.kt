@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -178,7 +179,7 @@ private fun StepLine(index: Int, text: String) {
 private fun AvatarDot(label: String, color: Color, overlap: Boolean = false) {
     Box(
         modifier = Modifier
-            .padding(start = if (overlap) (-8).dp else 0.dp)
+            .offset(x = if (overlap) (-8).dp else 0.dp)
             .size(24.dp)
             .clip(CircleShape)
             .background(color),

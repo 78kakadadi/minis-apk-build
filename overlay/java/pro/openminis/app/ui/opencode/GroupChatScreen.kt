@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -648,7 +649,7 @@ private fun AvatarStack(members: List<GroupMemberDef>) {
         members.take(3).forEachIndexed { index, m ->
             Box(
                 modifier = Modifier
-                    .padding(start = if (index == 0) 0.dp else (-8).dp)
+                    .offset(x = if (index == 0) 0.dp else (-8).dp)
                     .size(26.dp)
                     .clip(CircleShape)
                     .background(Color(AiAvatars.resolve(m).color)),
