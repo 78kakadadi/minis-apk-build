@@ -86,9 +86,9 @@ data class ServiceConfig(
 ) {
     val baseUrl: String get() = "http://$hostname:$port"
 
-    /** OpenCode 的 Basic 认证用户名固定为 `opencode`。 */
+    /** OpenCode 2.x 的 Basic 认证用户名固定为 `opencode`，密码是 serve 自己生成并打印的那个。 */
     val authorization: String
-        get() = "Basic " + Base64.getEncoder()
+        get() = if (password.isEmpty()) "" else "Basic " + Base64.getEncoder()
             .encodeToString("opencode:$password".toByteArray(Charsets.UTF_8))
 
     /** 打日志用的脱敏形式。 */
@@ -107,15 +107,29 @@ data class ServiceConfig(
     companion object {
         const val HOSTNAME = "127.0.0.1"
 
-        /** 生成随机密码：32 字节 url-safe base64，无需转义即可放进 JSON 与 Header。 */
+        /**
+         * 生成随机密码：32 字节 url-safe base64，无需转义即可放进 JSON 与 Header。
+         *
+         * 只在**服务端没有给出密码**时兜底（1.x 行为）。2.x 必须用
+         * [pro.openminis.app.ext.opencode.runtime.OpencodeProcessManager] 从
+         * stdout 解析到的那个——自己造密码等于每个请求 401。
+         */
         fun generatePassword(random: SecureRandom = SecureRandom()): String {
             val bytes = ByteArray(32)
             random.nextBytes(bytes)
             return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
         }
 
-        fun create(port: Int, pid: Long?, now: Long, random: SecureRandom = SecureRandom()): ServiceConfig =
-            ServiceConfig(port, HOSTNAME, generatePassword(random), pid, now)
+        fun create(
+            port: Int,
+            pid: Long?,
+            now: Long,
+            password: String = generatePassword(),
+        ): ServiceConfig = ServiceConfig(port, HOSTNAME, password, pid, now)
+
+        /** 兼容旧调用：显式传入随机源时按它生成密码。 */
+        fun create(port: Int, pid: Long?, now: Long, random: SecureRandom): ServiceConfig =
+            create(port, pid, now, generatePassword(random))
 
         /**
          * 解析失败返回 null。**不抛异常**：一个损坏的 service.json 只是"需要重建"，

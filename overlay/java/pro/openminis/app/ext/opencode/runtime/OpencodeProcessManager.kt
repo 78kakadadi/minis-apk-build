@@ -80,8 +80,8 @@ class OpencodeProcessManager(
             val process = launcher.start(command, layout.environment(), layout.workspace)
             running = process
 
-            val port = awaitPort(process)
-            if (port == null) {
+            val hs = awaitHandshake(process)
+            if (hs == null) {
                 destroyQuietly(process)
                 running = null
                 installer.clearService()
@@ -92,7 +92,17 @@ class OpencodeProcessManager(
                 )
             }
 
-            val service = installer.newService(port, process.safePid())
+            // 端口有了、密码没有：多半是版本不匹配（2.x 一定会打印 password）。
+            // 这时仍然继续启动，但把原因写进日志——否则后续每个请求 401，
+            // 用户只能看到「没有模型」。
+            if (hs.password.isEmpty()) {
+                installer.appendServerNote(
+                    "未从输出解析到 server password，将按无认证访问；" +
+                        "若模型列表为空，说明该版本要求认证但输出格式已变。",
+                )
+            }
+
+            val service = installer.newService(hs.port, process.safePid(), hs.password)
             installer.writeService(service)
 
             if (!awaitHealthy(service)) {
@@ -123,11 +133,11 @@ class OpencodeProcessManager(
         installer.clearService()
     }
 
-    /** 真实健康检查：`GET /global/health`，带 Basic 认证。 */
+    /** 真实健康检查：`GET /global/health`，有密码时带 Basic 认证。 */
     fun defaultHealth(service: ServiceConfig): Boolean = try {
         val req = Request.Builder()
             .url("${service.baseUrl}/global/health")
-            .header("Authorization", service.authorization)
+            .apply { if (service.password.isNotEmpty()) header("Authorization", service.authorization) }
             .build()
         http.newCall(req).execute().use { it.isSuccessful }
     } catch (e: Exception) {
@@ -136,28 +146,47 @@ class OpencodeProcessManager(
 
     // ---- 内部 ------------------------------------------------------------
 
-    /** 读 stdout 直到解析出端口。读线程单独开，主线程带超时等待。 */
-    private fun awaitPort(process: Process): Int? {
+    /**
+     * 读 stdout 直到同时拿到端口和密码。
+     *
+     * opencode 2.x 启动时打印两行：
+     * ```
+     * server listening on http://127.0.0.1:46061
+     * server password QFN37VNq_9KHOhyaXeUOO68yvGhzi7Ila8YNmu35CyY
+     * ```
+     * 密码是**服务端生成**的，客户端必须用它做 Basic 认证；自己造一个只会得到 401。
+     * 两次输出顺序不保证，所以两样都攒齐才返回。
+     */
+    private fun awaitHandshake(process: Process): Handshake? {
         val reader = process.inputStream.bufferedReader()
         val exec = Executors.newSingleThreadExecutor { r ->
             Thread(r, "opencode-stdout").apply { isDaemon = true }
         }
         return try {
-            val future = exec.submit<Int?> {
-                var found: Int? = null
+            val future = exec.submit<Handshake?> {
+                var port: Int? = null
+                var password: String? = null
+                var scanned = 0
                 while (true) {
                     val line = try {
                         reader.readLine()
                     } catch (e: Exception) {
                         break
                     } ?: break
-                    val port = PortParser.parsePort(line)
-                    if (port != null) {
-                        found = port
-                        break
+                    scanned += 1
+                    val clean = PortParser.stripAnsi(line)
+                    if (port == null) port = PortParser.parsePort(clean)
+                    if (password.isNullOrEmpty()) {
+                        password = PASSWORD.find(clean)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
                     }
+                    if (port != null && !password.isNullOrEmpty()) break
+                    // 某些版本会持续刷日志；给它一个上限，避免把线程永远挂在读上
+                    if (scanned > 500) break
                 }
-                found
+                when {
+                    port != null -> Handshake(port, password.orEmpty())
+                    else -> null
+                }
             }
             future.get(portTimeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
@@ -166,6 +195,8 @@ class OpencodeProcessManager(
             exec.shutdownNow()
         }
     }
+
+    private data class Handshake(val port: Int, val password: String)
 
     /** 构造函数默认参数不能引用成员函数，所以在这里做一次解析。 */
     private fun probe(service: ServiceConfig): Boolean =
@@ -197,6 +228,8 @@ class OpencodeProcessManager(
 interface ProcessLauncher {
     fun start(command: List<String>, env: Map<String, String>, workDir: File?): Process
 }
+
+private val PASSWORD = Regex("""server\s+password\s+(\S+)""", RegexOption.IGNORE_CASE)
 
 class SystemProcessLauncher : ProcessLauncher {
     override fun start(command: List<String>, env: Map<String, String>, workDir: File?): Process {

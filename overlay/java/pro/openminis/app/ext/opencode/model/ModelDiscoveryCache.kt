@@ -36,13 +36,19 @@ class ModelDiscoveryCache(
     fun shouldRefresh(cachedAt: Long?): Boolean =
         cachedAt == null || clock() - cachedAt >= ttlMs || cachedAt > clock() + 60_000
 
-    /** 从 `/config/providers` 的响应体里挑出免费模型。 */
+    /** 从模型清单里挑出免费模型。兼容 2.x 扁平结构与 1.x 的 provider 分组结构。 */
     fun selectFree(payload: String): List<FreeModel> {
         val root = try {
             Json.parseToJsonElement(payload)
         } catch (e: Exception) {
             return emptyList()
         }
+
+        // 2.x：{ location, data: [ {id, modelID, providerID, name, cost:[{input,output}]} ] }
+        val flat = (root as? JsonObject)?.get("data") as? JsonArray
+        if (flat != null) return preferKnown(parseFlat(flat))
+
+        // 1.x：{ providers: [ {id, models:{ id: {...} }} ] }
         val providers = when (root) {
             is JsonArray -> root
             is JsonObject -> root["providers"] as? JsonArray ?: JsonArray(emptyList())
@@ -67,6 +73,39 @@ class ModelDiscoveryCache(
             }
         }
         return preferKnown(out.toList())
+    }
+
+    /** 2.x 的扁平列表。id 取 `modelID`（有些版本 id 带 provider 前缀）。 */
+    private fun parseFlat(flat: JsonArray): List<FreeModel> =
+        flat.mapNotNull { e ->
+            val o = e as? JsonObject ?: return@mapNotNull null
+            val id = o.str("modelID") ?: o.str("id") ?: return@mapNotNull null
+            val name = o.str("name") ?: ""
+            val pid = o.str("providerID") ?: "opencode"
+            if (!isFree(o, id, name)) return@mapNotNull null
+            FreeModel(id = id, name = name, providerId = pid)
+        }
+
+    /**
+     * 免费判定。
+     *
+     * 2.x 给了 `cost` 数组，全 0 就是免费——这比匹配名字可靠得多：
+     * 名字里的 "free" 是营销文案，会变；价格字段是计费口径，骗不了人。
+     * `cost` 缺失时才回落到名字/已知清单。
+     */
+    private fun isFree(model: JsonObject, id: String, name: String): Boolean {
+        val cost = model["cost"] as? JsonArray
+        if (cost != null && cost.isNotEmpty()) {
+            val allZero = cost.all { c ->
+                val o = c as? JsonObject ?: return@all false
+                val input = (o["input"] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: return@all false
+                val output = (o["output"] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: return@all false
+                input == 0.0 && output == 0.0
+            }
+            if (allZero) return true
+        }
+        val known = id in KNOWN_FREE_SET
+        return known || looksFree(id) || looksFree(name)
     }
 
     private fun addIfFree(

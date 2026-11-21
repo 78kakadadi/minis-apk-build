@@ -8,6 +8,8 @@ import pro.openminis.app.data.model.ProviderCredential
 import pro.openminis.app.data.model.ProviderInstance
 import pro.openminis.app.data.model.ProviderType
 import pro.openminis.app.data.repository.ProviderRepository
+import pro.openminis.app.ext.opencode.api.OpencodeServerClient
+import pro.openminis.app.ext.opencode.api.ServerHttpException
 import pro.openminis.app.ext.opencode.bridge.OpenAiBridgeServer
 import pro.openminis.app.ext.opencode.model.FreeModel
 import pro.openminis.app.ext.opencode.model.ModelDiscoveryCache
@@ -31,7 +33,11 @@ import java.util.Locale
 sealed interface FreeTokenStatus {
     data object Off : FreeTokenStatus
     data class Working(val step: String, val progress: Int) : FreeTokenStatus
-    data class Running(val baseUrl: String, val model: String?) : FreeTokenStatus
+    /**
+     * 服务已就绪。[note] 用来解释「服务在跑但结果不对」的情况：
+     * 模型清单 401、清单里没有免费模型、或未解析到密码。
+     */
+    data class Running(val baseUrl: String, val model: String?, val note: String? = null) : FreeTokenStatus
     data class Error(val message: String, val retryable: Boolean = true) : FreeTokenStatus
 }
 
@@ -71,6 +77,10 @@ class FreeTokenManager private constructor(context: Context) {
     val models: StateFlow<List<FreeModel>> = _models.asStateFlow()
 
     private val discovery = ModelDiscoveryCache()
+
+    /** 最近一次模型发现失败的可读原因，UI 直接显示，避免「就是没有模型」这种哑谜。 */
+    @Volatile
+    private var modelError: String? = null
 
     private val bridge = OpenAiBridgeServer(
         service = { installer.readService() },
@@ -151,10 +161,11 @@ class FreeTokenManager private constructor(context: Context) {
                 .onFailure { writeLog("register", "注册失败：${it.message}") }
 
             store.lastPort = bridgePort
-            store.lastError = null
+            store.lastError = modelError
             _status.value = FreeTokenStatus.Running(
                 baseUrl = bridgeBaseUrl ?: "",
                 model = model,
+                note = statusNote(),
             )
         }
     }
@@ -201,14 +212,35 @@ class FreeTokenManager private constructor(context: Context) {
     // ---- 模型发现 ---------------------------------------------------------
 
     private suspend fun refreshModelsLocked(service: ServiceConfig) {
-        val payload = runCatching { providersJson(service) }.getOrNull()
-        if (payload.isNullOrBlank()) {
-            writeLog("models", "GET /config/providers 无响应，保留已有清单")
+        val client = OpencodeServerClient(http, service) { writeLog("server", it) }
+        val payload = try {
+            client.modelsJson()
+        } catch (e: ServerHttpException) {
+            // 401 基本只有一个原因：用的不是 serve 打印出来的那个密码
+            val why = if (e.code == 401) {
+                "模型清单被拒绝（HTTP 401）——认证密码与 serve 输出的不一致"
+            } else {
+                "模型清单请求失败 HTTP ${e.code}"
+            }
+            writeLog("models", "$why；响应：${e.bodyPreview.take(300)}")
+            modelError = why
+            return
+        } catch (e: Exception) {
+            val why = "模型清单请求异常：${e.message ?: e.javaClass.simpleName}"
+            writeLog("models", why)
+            modelError = why
             return
         }
+
         val found = discovery.selectFree(payload)
         writeLog("models", "发现 ${found.size} 个免费模型：${found.joinToString { it.id }}")
-        if (found.isNotEmpty()) _models.value = found
+        if (found.isEmpty()) {
+            modelError = "服务端返回了模型清单，但里面没有免费模型"
+            writeLog("models", "清单原文（前 600 字）：${payload.take(600)}")
+        } else {
+            modelError = null
+            _models.value = found
+        }
     }
 
     fun refreshModels() {
@@ -219,17 +251,8 @@ class FreeTokenManager private constructor(context: Context) {
             _status.value = FreeTokenStatus.Running(
                 baseUrl = bridgeBaseUrl ?: "",
                 model = store.defaultModel,
+                note = statusNote(),
             )
-        }
-    }
-
-    private fun providersJson(service: ServiceConfig): String? {
-        val req = Request.Builder()
-            .url("${service.baseUrl}/config/providers")
-            .header("Authorization", service.authorization)
-            .build()
-        return http.newCall(req).execute().use { resp ->
-            if (resp.isSuccessful) resp.body?.string() else null
         }
     }
 
@@ -319,6 +342,10 @@ class FreeTokenManager private constructor(context: Context) {
             writeLog("register", "默认模型组设为 $name")
         }
     }
+
+    /** 运行中状态的补充说明：优先报错原因，其次报「一个模型都没有」。 */
+    private fun statusNote(): String? = modelError
+        ?: if (_models.value.isEmpty()) "没有可用模型：服务端清单为空或全部被判为收费" else null
 
     // ---- 诊断 -------------------------------------------------------------
 

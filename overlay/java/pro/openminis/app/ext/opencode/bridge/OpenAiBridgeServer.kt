@@ -1,19 +1,11 @@
 package pro.openminis.app.ext.opencode.bridge
 
+import pro.openminis.app.ext.opencode.api.OpencodeServerClient
 import pro.openminis.app.ext.opencode.api.StreamEvent
 import pro.openminis.app.ext.opencode.model.FreeModel
 import pro.openminis.app.ext.opencode.runtime.ServiceConfig
-import pro.openminis.app.ext.opencode.sse.OpencodeSseClient
-import pro.openminis.app.ext.opencode.sse.PartDeltaTracker
-import pro.openminis.app.ext.opencode.stream.OpencodeChunkMapper
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -48,8 +40,6 @@ class OpenAiBridgeServer(
     private val models: () -> List<FreeModel>,
     private val log: (String) -> Unit = {},
 ) {
-
-    private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
     @Volatile
     private var server: ServerSocket? = null
@@ -230,9 +220,10 @@ class OpenAiBridgeServer(
             return
         }
 
-        val sid = createSession(svc)
-        val mapper = OpencodeChunkMapper(sid, PartDeltaTracker())
-        val sse = OpencodeSseClient(http, svc.baseUrl, svc.authorization)
+        // 2.x 的模型是在建会话时选定的，所以先把 id 映射回 {id, providerID}
+        val target = resolveModel(model)
+        val client = OpencodeServerClient(http, svc) { log(it) }
+        val sid = client.createSession(target, "minis-${System.currentTimeMillis()}")
         val id = "chatcmpl-${seq.incrementAndGet()}"
         val created = System.currentTimeMillis() / 1000
 
@@ -244,36 +235,40 @@ class OpenAiBridgeServer(
 
         runBlocking {
             try {
-                coroutineScope {
-                    launch(Dispatchers.IO) { runCatching { prompt(svc, sid, transcript, model) } }
-                    sse.frames(sid).collect { frame ->
-                        mapper.map(frame).events.forEach { ev ->
-                            when (ev) {
-                                is StreamEvent.Text -> {
-                                    text.append(ev.text)
-                                    if (stream) emitDelta(out, id, created, model, ev.text, null, null)
-                                }
-                                is StreamEvent.Reasoning -> {
-                                    // OpenAI 客户端不认识这个字段，但自家的群聊引擎会读
-                                    if (stream) emitDelta(out, id, created, model, null, null, ev.text)
-                                }
-                                is StreamEvent.Finished -> {
-                                    finished = true
-                                    if (stream) emitDelta(out, id, created, model, null, ev.stopReason, null)
-                                }
-                                is StreamEvent.Failed -> failure = ev.message
-                                else -> Unit
+                client.events(sid).collect { ev ->
+                    when (ev) {
+                        // 连接建立后才发 prompt：否则首包 text.delta 会比订阅更早到，正文就丢了
+                        StreamEvent.Started -> {
+                            try {
+                                client.prompt(sid, transcript)
+                            } catch (e: Exception) {
+                                failure = e.message ?: e.javaClass.simpleName
                             }
                         }
-                        if (finished || failure != null) throw StopStream()
+                        is StreamEvent.Text -> {
+                            text.append(ev.text)
+                            if (stream) emitDelta(out, id, created, model, ev.text, null, null)
+                        }
+                        is StreamEvent.Reasoning -> {
+                            // OpenAI 客户端不认识这个字段，但自家的群聊引擎会读
+                            if (stream) emitDelta(out, id, created, model, null, null, ev.text)
+                        }
+                        is StreamEvent.Finished -> {
+                            finished = true
+                            if (stream) emitDelta(out, id, created, model, null, ev.stopReason, null)
+                        }
+                        is StreamEvent.Failed -> failure = ev.message
+                        else -> Unit
                     }
+                    if (finished || failure != null) throw StopStream()
                 }
+                if (!finished && failure == null) failure = "事件流提前结束（未收到结束事件）"
             } catch (e: StopStream) {
                 // 正常收尾
             } catch (e: Exception) {
                 failure = failure ?: (e.message ?: e.javaClass.simpleName)
             } finally {
-                runCatching { deleteSession(svc, sid) }
+                client.deleteSession(sid)
             }
         }
 
@@ -394,64 +389,18 @@ class OpenAiBridgeServer(
         else -> ""
     }
 
-    // ---- OpenCode 原生调用 ------------------------------------------------
-
-    private fun createSession(svc: ServiceConfig): String {
-        val body = JSONObject().put("title", "minis-${System.currentTimeMillis()}").toString()
-        val req = Request.Builder()
-            .url("${svc.baseUrl}/session")
-            .header("Authorization", svc.authorization)
-            .post(body.toRequestBody(jsonMedia))
-            .build()
-        http.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw IllegalStateException("创建会话失败 HTTP ${resp.code}: ${text.take(200)}")
-            return JSONObject(text).optString("id").takeIf { it.isNotBlank() }
-                ?: throw IllegalStateException("会话响应缺少 id: ${text.take(200)}")
-        }
-    }
-
-    /** 尽力而为：删不掉只是服务端多留一条空会话，不影响本次回复。 */
-    private fun deleteSession(svc: ServiceConfig, sid: String) {
-        val req = Request.Builder()
-            .url("${svc.baseUrl}/session/$sid")
-            .header("Authorization", svc.authorization)
-            .delete()
-            .build()
-        runCatching { http.newCall(req).execute().close() }
-    }
+    // ---- 上游调用 --------------------------------------------------------
 
     /**
-     * 发送本轮文本。带 `model` 是让用户在设置里选的模型真正生效；
-     * 老版本 OpenCode 不认识该字段会 400，此时退回不带 model 的请求。
+     * 把 Minis 传来的模型 id 映射成 2.x 需要的 `{id, providerID}`。
+     *
+     * 找不到时退回清单第一个、再退回 big-pickle：宁可给个能用的模型，
+     * 也不要因为 id 对不上直接 400——那在用户看来就是「通道坏了」。
      */
-    private fun prompt(svc: ServiceConfig, sid: String, text: String, model: String) {
-        val parts = JSONArray().put(JSONObject().put("type", "text").put("text", text))
-        val withModel = JSONObject().put("parts", parts)
-        if (model.isNotBlank()) {
-            val slash = model.indexOf('/')
-            val providerID = if (slash > 0) model.substring(0, slash) else "opencode"
-            val modelID = if (slash > 0) model.substring(slash + 1) else model
-            withModel.put(
-                "model",
-                JSONObject().put("providerID", providerID).put("modelID", modelID),
-            )
-        }
-
-        fun send(payload: JSONObject): Int {
-            val req = Request.Builder()
-                .url("${svc.baseUrl}/session/$sid/prompt_async")
-                .header("Authorization", svc.authorization)
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { return it.code }
-        }
-
-        var code = send(withModel)
-        if (code == 400 && model.isNotBlank()) {
-            code = send(JSONObject().put("parts", parts))
-        }
-        if (code !in 200..299) throw IllegalStateException("prompt_async 返回 HTTP $code")
+    private fun resolveModel(requested: String): FreeModel {
+        val list = models()
+        val hit = list.firstOrNull { it.id == requested }
+        return hit ?: list.firstOrNull() ?: FreeModel("big-pickle", "Big Pickle", "opencode")
     }
 
     companion object {

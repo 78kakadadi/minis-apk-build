@@ -217,8 +217,16 @@ class OpencodeRuntimeInstaller(
         }
     }
 
-    fun newService(port: Int, pid: Long?): ServiceConfig =
-        ServiceConfig.create(port, pid, clock())
+    fun newService(port: Int, pid: Long?, password: String): ServiceConfig =
+        ServiceConfig.create(port, pid, clock(), password)
+
+    /** 往 server.log 追一行说明。启动/认证这类「没抛异常但结果不对」的情况靠它留痕。 */
+    fun appendServerNote(message: String) {
+        runCatching {
+            if (!layout.logsDir.exists()) layout.logsDir.mkdirs()
+            layout.serverLog.appendText("[installer] $message\n")
+        }
+    }
 
     private fun relative(file: File): String =
         file.absolutePath.removePrefix(layout.root.absolutePath).trimStart('/').ifEmpty { "opencode/" }
