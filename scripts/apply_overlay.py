@@ -535,6 +535,43 @@ def main() -> None:
         "onSkip = { step = 3 })",
     )
 
+    # 28) 主页：群聊模块放在会话列表顶部（不依赖是否已有会话）
+    patch(
+        sessions,
+        "            if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {\n",
+        "            if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {\n"
+        "                // 群聊模块：放在会话列表顶部，顺带在主页拉起免费通道\n"
+        "                com.openminis.app.ui.opencode.GroupChatHomeSection(\n"
+        "                    onOpen = { gid -> onGroupChatClick(gid) },\n"
+        "                    onCreate = { onGroupChatClick(null) },\n"
+        "                )\n",
+        "主页群聊模块",
+        "GroupChatHomeSection(",
+    )
+
+    # 29) 只有群、没有会话时也要显示列表（否则群聊看不到）
+    patch(
+        sessions,
+        "                if (sessions.isEmpty() && !(searchResultsActive && folderBlocks.isNotEmpty())) {",
+        "                if (sessions.isEmpty() &&\n"
+        "                    !com.openminis.app.ui.opencode.hasGroupChats(context) &&\n"
+        "                    !(searchResultsActive && folderBlocks.isNotEmpty())\n"
+        "                ) {",
+        "空状态让位给群聊",
+        "hasGroupChats(context)",
+    )
+
+    # 30) 没有会话但有群时，底部新对话按钮仍要显示（否则无法长按建群）
+    patch(
+        sessions,
+        "            } else if (hasProviders && (sessions.isNotEmpty() || isSearchActive)) {",
+        "            } else if (hasProviders && (sessions.isNotEmpty() || isSearchActive ||\n"
+        "                com.openminis.app.ui.opencode.hasGroupChats(context))\n"
+        "            ) {",
+        "底部按钮常驻",
+        "hasGroupChats(context))\n            ) {",
+    )
+
     print("注入完成。")
 
 if __name__ == "__main__":

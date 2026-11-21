@@ -3,6 +3,7 @@ package com.openminis.app.ext.opencode.runtime
 import android.content.Context
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.ModelEntry
+import com.openminis.app.data.model.ModelGroup
 import com.openminis.app.data.model.ProviderCredential
 import com.openminis.app.data.model.ProviderInstance
 import com.openminis.app.data.model.ProviderType
@@ -288,7 +289,35 @@ class FreeTokenManager private constructor(context: Context) {
                 )
             }
         }
+        ensureModelGroup(repo, id)
         writeLog("register", "provider=$id base=$base models=${_models.value.size}")
+    }
+
+    /**
+     * 把免费模型放进一个模型组，并（仅在用户还没有默认组时）设为默认。
+     *
+     * 上游聊天页选的是「模型组」而不是单个 entry——只 addEntry 不进组，
+     * 模型在选择器里就是不出现，用户看到的仍是「免费通道用不了」。
+     * 已经有默认组的用户不动他的选择，避免升级后模型被悄悄换掉。
+     */
+    private fun ensureModelGroup(repo: ProviderRepository, instanceId: String) {
+        val entryIds = repo.entriesFor(instanceId).map { it.id }
+        if (entryIds.isEmpty()) return
+
+        val name = GROUP_NAME
+        val existing = repo.config.value.modelGroups.firstOrNull { it.name == name }
+        val groupId = if (existing == null) {
+            repo.addGroup(ModelGroup(name = name, memberEntryIds = entryIds.toMutableList()))
+            repo.config.value.modelGroups.firstOrNull { it.name == name }?.id
+        } else {
+            repo.updateGroup(existing.copy(memberEntryIds = entryIds.toMutableList()))
+            existing.id
+        }
+
+        if (groupId != null && repo.defaultPrimaryGroupId == null) {
+            repo.defaultPrimaryGroupId = groupId
+            writeLog("register", "默认模型组设为 $name")
+        }
     }
 
     // ---- 诊断 -------------------------------------------------------------
@@ -328,6 +357,7 @@ class FreeTokenManager private constructor(context: Context) {
         const val BINARY_NAME = "libopencode.so"
         const val INSTANCE_ID = "opencode-local-free"
         const val LABEL = "内置 OpenCode（免费）"
+        const val GROUP_NAME = "内置 OpenCode（免费）"
 
         private val NON_RETRYABLE = setOf(
             StartFailure.BINARY_MISSING,

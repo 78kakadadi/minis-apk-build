@@ -29,25 +29,18 @@ import java.util.concurrent.atomic.AtomicInteger
  * 一个极小的 OpenAI 兼容服务，把 `POST /v1/chat/completions` 翻译成
  * OpenCode 的 `POST /session` + `POST /session/:id/prompt_async` + SSE 事件流。
  *
- * ## 为什么需要这一层
+ * ## 为什么是「无状态」的
  *
- * Minis 的聊天链路只认 `LLMProvider` 的 `OpenAIProvider`（`provider/openai`），
- * 它把请求发往某个 `http(s)://host/v1/chat/completions`。OpenCode 的 serve
- * 说的是自己的原生协议（`/session`、`/event`），不兼容 OpenAI。因此
- * 「免费 Token 通道」要真正可用，只有两条路：
+ * 早期版本复用同一个 OpenCode 会话、只发最后一条 user 消息，省 token，但有两个
+ * 致命问题：
+ *  1. 不同会话（两个聊天、群聊里的两个成员）会互相看到对方的上下文；
+ *  2. 上游每次发完整 transcript，桥接却只取最后一条，历史等于被丢掉。
  *
- *  1. 写一个新的 `ProviderType` 并改上游工厂——侵入面大，上游一升级就冲突；
- *  2. 在本机起一个 OpenAI 兼容端点，让上游把它当成普通的「自定义 baseURL」
- *     provider——零侵入，会话、工具、流式、错误重试全部复用上游成熟实现。
+ * 现在改成：**每个请求新建一个 OpenCode 会话，把整段 transcript 作为一段文本发过去，
+ * 结束后删掉会话**。多花一些输入 token，换来的是「谁的上下文就是谁的」——
+ * 群聊里 A 看不到 B 的思考过程，靠的就是这一条。
  *
- * 这里选 2。桥接只监听 `127.0.0.1`，随机端口，外部不可达。
- *
- * ## 会话语义
- *
- * OpenAI 协议里没有「会话」概念，而 OpenCode 有。桥接用「本轮只发新消息」
- * 的判据：请求里只有 1 条 user 消息 = 新会话（`POST /session`），否则复用
- * 当前会话并只发最后一条增量。这与上游每次发送完整 transcript 的行为兼容，
- * 又不会把历史重复喂给 OpenCode（重复会破坏前缀缓存）。
+ * 桥接只监听 `127.0.0.1`，随机端口，外部不可达。
  */
 class OpenAiBridgeServer(
     private val service: () -> ServiceConfig?,
@@ -67,10 +60,6 @@ class OpenAiBridgeServer(
     private val pool = Executors.newFixedThreadPool(6) { r ->
         Thread(r, "opencode-bridge").apply { isDaemon = true }
     }
-
-    /** 当前对话对应的 OpenCode 会话。桥接是单会话的（一次只服务一个聊天）。 */
-    @Volatile
-    private var sessionId: String? = null
 
     private val seq = AtomicInteger(0)
 
@@ -96,16 +85,13 @@ class OpenAiBridgeServer(
     }
 
     fun stop() {
-        sessionId = null
         runCatching { server?.close() }
         server = null
         port = 0
     }
 
-    /** 新建会话（用户开新对话 / 切模型时调用）。 */
-    fun resetSession() {
-        sessionId = null
-    }
+    /** 保留接口：无状态桥接下开新对话不需要清任何东西。 */
+    fun resetSession() = Unit
 
     // ---- HTTP ----------------------------------------------------------
 
@@ -118,7 +104,7 @@ class OpenAiBridgeServer(
 
     private fun handle(client: Socket) {
         client.use { socket ->
-            socket.soTimeout = 120_000
+            socket.soTimeout = 180_000
             try {
                 val input = BufferedInputStream(socket.getInputStream())
                 val req = readRequest(input) ?: return
@@ -238,16 +224,13 @@ class OpenAiBridgeServer(
         val stream = body.optBoolean("stream", false)
         val messages = body.optJSONArray("messages") ?: JSONArray()
 
-        val lastUser = lastUserText(messages)
-        if (lastUser.isBlank()) {
-            writeJson(out, 400, """{"error":{"message":"messages 中没有 user 内容"}}""")
+        val transcript = renderTranscript(messages)
+        if (transcript.isBlank()) {
+            writeJson(out, 400, """{"error":{"message":"messages 内容为空"}}""")
             return
         }
 
-        // 只有一条 user 消息 = 新对话：新建 OpenCode 会话，避免上一轮上下文串进来
-        val isNewConversation = countUser(messages) <= 1
-        val sid = runBlocking { ensureSession(svc, isNewConversation) }
-
+        val sid = createSession(svc)
         val mapper = OpencodeChunkMapper(sid, PartDeltaTracker())
         val sse = OpencodeSseClient(http, svc.baseUrl, svc.authorization)
         val id = "chatcmpl-${seq.incrementAndGet()}"
@@ -262,17 +245,21 @@ class OpenAiBridgeServer(
         runBlocking {
             try {
                 coroutineScope {
-                    launch(Dispatchers.IO) { runCatching { prompt(svc, sid, lastUser, model) } }
+                    launch(Dispatchers.IO) { runCatching { prompt(svc, sid, transcript, model) } }
                     sse.frames(sid).collect { frame ->
                         mapper.map(frame).events.forEach { ev ->
                             when (ev) {
                                 is StreamEvent.Text -> {
                                     text.append(ev.text)
-                                    if (stream) emitDelta(out, id, created, model, ev.text)
+                                    if (stream) emitDelta(out, id, created, model, ev.text, null, null)
+                                }
+                                is StreamEvent.Reasoning -> {
+                                    // OpenAI 客户端不认识这个字段，但自家的群聊引擎会读
+                                    if (stream) emitDelta(out, id, created, model, null, null, ev.text)
                                 }
                                 is StreamEvent.Finished -> {
                                     finished = true
-                                    if (stream) emitDelta(out, id, created, model, null, ev.stopReason)
+                                    if (stream) emitDelta(out, id, created, model, null, ev.stopReason, null)
                                 }
                                 is StreamEvent.Failed -> failure = ev.message
                                 else -> Unit
@@ -285,6 +272,8 @@ class OpenAiBridgeServer(
                 // 正常收尾
             } catch (e: Exception) {
                 failure = failure ?: (e.message ?: e.javaClass.simpleName)
+            } finally {
+                runCatching { deleteSession(svc, sid) }
             }
         }
 
@@ -339,10 +328,12 @@ class OpenAiBridgeServer(
         created: Long,
         model: String,
         content: String?,
-        stopReason: String? = null,
+        stopReason: String?,
+        reasoning: String?,
     ) {
         val delta = JSONObject()
         if (content != null) delta.put("content", content)
+        if (reasoning != null) delta.put("reasoning_content", reasoning)
         val choice = JSONObject()
             .put("index", 0)
             .put("delta", delta)
@@ -357,44 +348,56 @@ class OpenAiBridgeServer(
         out.flush()
     }
 
-    private fun countUser(messages: JSONArray): Int {
-        var n = 0
+    /**
+     * 把 OpenAI 的 messages 铺成一段文本。
+     *
+     * OpenCode 的 prompt 只有一个 `parts[].text`，没有 role 结构；用带标签的文本
+     * 表达角色，模型仍能正确区分，而历史/系统设定都不会丢。
+     */
+    private fun renderTranscript(messages: JSONArray): String {
+        val sb = StringBuilder()
+        var systemSeen = false
+        val turns = StringBuilder()
         for (i in 0 until messages.length()) {
-            if (messages.optJSONObject(i)?.optString("role") == "user") n++
-        }
-        return n
-    }
-
-    private fun lastUserText(messages: JSONArray): String {
-        for (i in messages.length() - 1 downTo 0) {
             val m = messages.optJSONObject(i) ?: continue
-            if (m.optString("role") != "user") continue
-            val c = m.opt("content")
-            return when (c) {
-                is String -> c
-                is JSONArray -> buildString {
-                    for (j in 0 until c.length()) {
-                        val part = c.optJSONObject(j) ?: continue
-                        if (part.optString("type") == "text") append(part.optString("text"))
+            val role = m.optString("role")
+            val content = contentText(m.opt("content"))
+            if (content.isBlank()) continue
+            when (role) {
+                "system", "developer" -> {
+                    if (!systemSeen) {
+                        sb.append("【系统设定】\n").append(content).append("\n\n")
+                        systemSeen = true
                     }
                 }
-                else -> ""
+                "user" -> turns.append("【用户】").append(content).append("\n")
+                "assistant" -> turns.append("【助手】").append(content).append("\n")
+                "tool" -> turns.append("【工具结果】").append(content.take(2000)).append("\n")
+                else -> Unit
             }
         }
-        return ""
+        if (!systemSeen) sb.append("【系统设定】\n你是一个可靠的中文助手。\n\n")
+        sb.append("【对话记录】\n").append(turns)
+        sb.append("\n请沿用上面的设定，只输出对最后一条用户消息的回复，不要复述对话记录，")
+        sb.append("也不要输出「【用户】」「【助手】」这类标签。")
+        return sb.toString().trim()
+    }
+
+    private fun contentText(c: Any?): String = when (c) {
+        is String -> c
+        is JSONArray -> buildString {
+            for (j in 0 until c.length()) {
+                val part = c.optJSONObject(j) ?: continue
+                if (part.optString("type") == "text") append(part.optString("text"))
+            }
+        }
+        else -> ""
     }
 
     // ---- OpenCode 原生调用 ------------------------------------------------
 
-    private fun ensureSession(svc: ServiceConfig, recreate: Boolean): String = synchronized(this) {
-        if (!recreate) sessionId?.let { return it }
-        val newId = createSession(svc)
-        sessionId = newId
-        newId
-    }
-
     private fun createSession(svc: ServiceConfig): String {
-        val body = JSONObject().put("title", "minis-free-${System.currentTimeMillis()}").toString()
+        val body = JSONObject().put("title", "minis-${System.currentTimeMillis()}").toString()
         val req = Request.Builder()
             .url("${svc.baseUrl}/session")
             .header("Authorization", svc.authorization)
@@ -408,8 +411,18 @@ class OpenAiBridgeServer(
         }
     }
 
+    /** 尽力而为：删不掉只是服务端多留一条空会话，不影响本次回复。 */
+    private fun deleteSession(svc: ServiceConfig, sid: String) {
+        val req = Request.Builder()
+            .url("${svc.baseUrl}/session/$sid")
+            .header("Authorization", svc.authorization)
+            .delete()
+            .build()
+        runCatching { http.newCall(req).execute().close() }
+    }
+
     /**
-     * 发送本轮增量。带 `model` 是让用户在设置里选的模型真正生效；
+     * 发送本轮文本。带 `model` 是让用户在设置里选的模型真正生效；
      * 老版本 OpenCode 不认识该字段会 400，此时退回不带 model 的请求。
      */
     private fun prompt(svc: ServiceConfig, sid: String, text: String, model: String) {

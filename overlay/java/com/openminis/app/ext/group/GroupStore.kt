@@ -13,9 +13,18 @@ data class GroupDef(
     val strategy: TurnStrategy = TurnStrategy.ROUND_ROBIN,
     val allowTakeover: Boolean = false,
     val createdAt: Long = 0L,
+    /**
+     * 成员发言前先自检「这个任务适合我吗」，不适合就跳过本轮。
+     * 群设置里可关；关掉后所有成员都会发言。
+     */
+    val autoTaskFit: Boolean = true,
 )
 
-/** 群成员。`modelId` 是桥接暴露的模型 id（如 `big-pickle`）。 */
+/**
+ * 群成员。`modelId` 是模型 id；[source] 决定去哪个端点请求：
+ *  - `free`：本机免费通道的桥接（OpenCode）
+ *  - `provider`：用户自己存的 API（[providerInstanceId] + `modelId`）
+ */
 data class GroupMemberDef(
     val id: String,
     val groupId: String,
@@ -23,7 +32,20 @@ data class GroupMemberDef(
     val modelId: String,
     val displayName: String,
     val enabled: Boolean = true,
-)
+    val source: String = SOURCE_FREE,
+    val providerInstanceId: String = "",
+    /** low / medium / high —— 只影响这个成员的思考强度，不影响别人。 */
+    val reasoning: String = "medium",
+    /** 头像字母（留空则按模型自动取厂商标识）。 */
+    val avatarLabel: String = "",
+    /** 头像底色 ARGB（0 = 按模型自动配色）。 */
+    val avatarColor: Int = 0,
+) {
+    companion object {
+        const val SOURCE_FREE = "free"
+        const val SOURCE_PROVIDER = "provider"
+    }
+}
 
 /** 群消息。`memberId` 为空表示用户消息。 */
 data class GroupMessage(
@@ -37,6 +59,10 @@ data class GroupMessage(
     val quoteMemberId: String? = null,
     val quotePreview: String? = null,
     val failed: Boolean = false,
+    /** 该成员的思考过程。只给用户看，绝不进入其他成员的上下文。 */
+    val thinking: String? = null,
+    /** 成员自检「不适合自己」而跳过本轮。 */
+    val skipped: Boolean = false,
 ) {
     val isUser: Boolean get() = role == "user"
 }
@@ -67,8 +93,11 @@ class GroupStore(context: Context) {
                 .getOrDefault(TurnStrategy.ROUND_ROBIN),
             allowTakeover = o.optBoolean("allowTakeover", false),
             createdAt = o.optLong("createdAt"),
+            autoTaskFit = o.optBoolean("autoTaskFit", true),
         )
-    }.filter { it.id.isNotBlank() }
+    }.sortedByDescending { it.createdAt }.filter { it.id.isNotBlank() }
+
+    fun group(groupId: String): GroupDef? = groups().firstOrNull { it.id == groupId }
 
     fun createGroup(name: String): GroupDef {
         val group = GroupDef(
@@ -84,11 +113,16 @@ class GroupStore(context: Context) {
                 .put("name", group.name)
                 .put("strategy", group.strategy.name)
                 .put("allowTakeover", group.allowTakeover)
+                .put("autoTaskFit", group.autoTaskFit)
                 .put("createdAt", group.createdAt),
         )
         root.put("groups", arr)
         writeIndex(root)
         return group
+    }
+
+    fun renameGroup(groupId: String, name: String) {
+        updateGroup(groupId) { it.put("name", name.trim().ifBlank { "新群聊" }) }
     }
 
     fun deleteGroup(groupId: String) {
@@ -120,6 +154,10 @@ class GroupStore(context: Context) {
         updateGroup(groupId) { it.put("allowTakeover", allow) }
     }
 
+    fun setAutoTaskFit(groupId: String, enabled: Boolean) {
+        updateGroup(groupId) { it.put("autoTaskFit", enabled) }
+    }
+
     private fun updateGroup(groupId: String, block: (JSONObject) -> Unit) {
         val root = readIndex()
         val arr = root.optJSONArray("groups") ?: return
@@ -141,31 +179,86 @@ class GroupStore(context: Context) {
                 modelId = o.str("modelId"),
                 displayName = o.str("displayName"),
                 enabled = o.optBoolean("enabled", true),
+                source = o.optString("source").ifBlank { GroupMemberDef.SOURCE_FREE },
+                providerInstanceId = o.optString("providerInstanceId"),
+                reasoning = o.optString("reasoning").ifBlank { "medium" },
+                avatarLabel = o.optString("avatarLabel"),
+                avatarColor = o.optInt("avatarColor", 0),
             )
         }.filter { it.groupId == groupId && it.id.isNotBlank() }
 
-    fun addMember(groupId: String, personaId: String, modelId: String, displayName: String): GroupMemberDef {
+    fun addMember(
+        groupId: String,
+        personaId: String,
+        modelId: String,
+        displayName: String,
+        source: String = GroupMemberDef.SOURCE_FREE,
+        providerInstanceId: String = "",
+        reasoning: String = "medium",
+    ): GroupMemberDef {
         val member = GroupMemberDef(
             id = "m_" + UUID.randomUUID().toString().take(8),
             groupId = groupId,
             personaId = personaId,
             modelId = modelId,
             displayName = displayName,
+            source = source,
+            providerInstanceId = providerInstanceId,
+            reasoning = reasoning,
         )
         val root = readIndex()
         val arr = root.optJSONArray("members") ?: JSONArray()
-        arr.put(
-            JSONObject()
-                .put("id", member.id)
-                .put("groupId", member.groupId)
-                .put("personaId", member.personaId)
-                .put("modelId", member.modelId)
-                .put("displayName", member.displayName)
-                .put("enabled", true),
-        )
+        arr.put(JSONObject().apply { writeMember(this, member) })
         root.put("members", arr)
         writeIndex(root)
         return member
+    }
+
+    private fun writeMember(o: JSONObject, member: GroupMemberDef) {
+        o.put("id", member.id)
+        o.put("groupId", member.groupId)
+        o.put("personaId", member.personaId)
+        o.put("modelId", member.modelId)
+        o.put("displayName", member.displayName)
+        o.put("enabled", member.enabled)
+        o.put("source", member.source)
+        o.put("providerInstanceId", member.providerInstanceId)
+        o.put("reasoning", member.reasoning)
+        o.put("avatarLabel", member.avatarLabel)
+        o.put("avatarColor", member.avatarColor)
+    }
+
+    fun updateMember(memberId: String, block: (JSONObject) -> Unit) {
+        val root = readIndex()
+        val arr = root.optJSONArray("members") ?: return
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (o.str("id") == memberId) block(o)
+        }
+        writeIndex(root)
+    }
+
+    fun setMemberEnabled(memberId: String, enabled: Boolean) =
+        updateMember(memberId) { it.put("enabled", enabled) }
+
+    fun setMemberReasoning(memberId: String, reasoning: String) =
+        updateMember(memberId) { it.put("reasoning", reasoning) }
+
+    fun setMemberAvatar(memberId: String, label: String, color: Int) =
+        updateMember(memberId) {
+            it.put("avatarLabel", label)
+            it.put("avatarColor", color)
+        }
+
+    fun setMemberModel(
+        memberId: String,
+        modelId: String,
+        source: String,
+        providerInstanceId: String,
+    ) = updateMember(memberId) {
+        it.put("modelId", modelId)
+        it.put("source", source)
+        it.put("providerInstanceId", providerInstanceId)
     }
 
     fun removeMember(memberId: String) {
@@ -177,16 +270,6 @@ class GroupStore(context: Context) {
             if (o.str("id") != memberId) kept.put(o)
         }
         root.put("members", kept)
-        writeIndex(root)
-    }
-
-    fun setMemberEnabled(memberId: String, enabled: Boolean) {
-        val root = readIndex()
-        val arr = root.optJSONArray("members") ?: return
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (o.str("id") == memberId) o.put("enabled", enabled)
-        }
         writeIndex(root)
     }
 
@@ -212,9 +295,14 @@ class GroupStore(context: Context) {
                 quoteMemberId = o.optString("quoteMemberId").ifBlank { null },
                 quotePreview = o.optString("quotePreview").ifBlank { null },
                 failed = o.optBoolean("failed", false),
+                thinking = o.optString("thinking").ifBlank { null },
+                skipped = o.optBoolean("skipped", false),
             )
         }
     }
+
+    /** 主页列表用：最后一条消息的预览文本。 */
+    fun lastMessage(groupId: String): GroupMessage? = messages(groupId).lastOrNull()
 
     fun appendMessage(message: GroupMessage) {
         val f = messagesFile(message.groupId)
@@ -232,7 +320,9 @@ class GroupStore(context: Context) {
                 .put("createdAt", message.createdAt)
                 .put("quoteMemberId", message.quoteMemberId ?: "")
                 .put("quotePreview", message.quotePreview ?: "")
-                .put("failed", message.failed),
+                .put("failed", message.failed)
+                .put("thinking", message.thinking ?: "")
+                .put("skipped", message.skipped),
         )
         root.put("messages", arr)
         f.parentFile?.mkdirs()

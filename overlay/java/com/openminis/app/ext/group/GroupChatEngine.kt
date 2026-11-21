@@ -16,29 +16,53 @@ import java.util.UUID
 sealed interface GroupEvent {
     data class MemberStarted(val memberId: String, val name: String) : GroupEvent
     data class MemberDelta(val memberId: String, val text: String) : GroupEvent
+
+    /** 思考过程：只回给本机 UI，绝不写入任何成员可见的上下文。 */
+    data class MemberThinking(val memberId: String, val text: String) : GroupEvent
     data class MemberFinished(val memberId: String, val name: String, val text: String) : GroupEvent
     data class MemberFailed(val memberId: String, val name: String, val reason: String) : GroupEvent
+
+    /** 成员自检后认为任务不适合自己，本轮不发言。 */
+    data class MemberSkipped(val memberId: String, val name: String, val reason: String) : GroupEvent
     data class Notice(val text: String) : GroupEvent
+}
+
+/**
+ * 一个成员这一次要请求的端点。
+ *
+ * `baseUrl` 已经包含 `/v1` 这类前缀，请求时直接拼 `/chat/completions`。
+ * 之所以做成「解析器」而不是在引擎里直接读上游仓库：引擎要能脱离 Android
+ * 依赖单独跑测试，而 ProviderRepository 是 Android 侧的异步单例。
+ */
+data class MemberEndpoint(
+    val baseUrl: String,
+    val apiKey: String,
+    val model: String,
+)
+
+fun interface MemberEndpointResolver {
+    fun resolve(member: GroupMemberDef): MemberEndpoint?
 }
 
 /**
  * 群聊引擎：把「一条用户消息」变成「若干成员依次发言」。
  *
- * 模型调用走本机 OpenAI 兼容桥接（免费通道）。这样群聊与单聊用**同一条**
- * 模型链路，不存在"群聊能用单聊不能用"的分裂状态。
+ * ## 上下文可见性（这是群聊最容易做错的地方）
  *
- * 三个刻意的取舍：
- *  1. **串行而非并行**：成员之间要看到彼此本轮发言（"我同意架构师的意见"），
- *     并行会让它们互相看不见，回复变成三份互不相关的独白。
- *  2. **每成员一条独立会话**：人设写进 system，历史只带公共群消息，
- *     成员不会污染彼此的私有上下文。
- *  3. **单轮上限 [MAX_SPEAKERS]**：免费池有速率限制，全员长回复很容易撞 429，
- *     而用户真正需要的通常只是前两三个视角。
+ * 用户的要求是：**每个 AI 的思考过程别人看不到；本轮其他成员的回复，也要等
+ * 群主下次发消息时才会被看到**。所以这里在写入用户消息**之前**先取一份历史快照，
+ * 整轮所有成员都只拿这份快照：
+ *
+ *  - 同一轮里 A 说完，B 看不到 A 这一轮的回复（B 的上下文里只有上一轮及更早）；
+ *  - 下一轮用户发言时，快照自然包含了 A、B 上一轮的最终答复；
+ *  - 思考过程（thinking）只落盘给用户看，构建上下文时从不读取。
+ *
+ * 串行而不是并行：免费池对并发很敏感，且串行才能保证发言顺序稳定。
  */
 class GroupChatEngine(
     private val store: GroupStore,
     private val personas: PersonaRepository,
-    private val baseUrl: () -> String?,
+    private val resolver: MemberEndpointResolver,
     private val http: OkHttpClient,
 ) {
 
@@ -55,24 +79,21 @@ class GroupChatEngine(
         quote: GroupMessage? = null,
         onEvent: suspend (GroupEvent) -> Unit,
     ) = withContext(Dispatchers.IO) {
-        val base = baseUrl()
-        if (base.isNullOrBlank()) {
-            onEvent(GroupEvent.Notice("免费 Token 通道未启用：请先到「设置 › 免费 Token 通道」启用"))
-            return@withContext
-        }
         if (text.isBlank()) return@withContext
 
-        val group = store.groups().firstOrNull { it.id == groupId } ?: run {
+        val group = store.group(groupId) ?: run {
             onEvent(GroupEvent.Notice("群不存在"))
             return@withContext
         }
         val members = store.members(groupId).filter { it.enabled }
         if (members.isEmpty()) {
-            onEvent(GroupEvent.Notice("这个群还没有成员：先「添加成员」"))
+            onEvent(GroupEvent.Notice("这个群还没有成员：先添加成员"))
             return@withContext
         }
 
-        val now = System.currentTimeMillis()
+        // 关键：先取快照，再写入本轮用户消息。见类注释的「上下文可见性」。
+        val history = store.messages(groupId).takeLast(HISTORY_LIMIT)
+
         val userMessage = GroupMessage(
             id = "msg_" + UUID.randomUUID().toString().take(8),
             groupId = groupId,
@@ -80,7 +101,7 @@ class GroupChatEngine(
             memberId = null,
             memberName = null,
             text = text.trim(),
-            createdAt = now,
+            createdAt = System.currentTimeMillis(),
             quoteMemberId = quote?.memberId,
             quotePreview = quote?.text?.take(120),
         )
@@ -131,9 +152,6 @@ class GroupChatEngine(
             }
         }
 
-        // 去掉刚写入的这条 user 消息：它在 streamMember 里会作为 current 单独追加，
-        // 不剔除就会把同一句话发两遍（模型会以为用户催了一次）
-        val history = store.messages(groupId).dropLast(1).takeLast(12)
         var spoken = 0
         for (memberId in order) {
             if (spoken >= MAX_SPEAKERS) break
@@ -141,22 +159,61 @@ class GroupChatEngine(
             val persona = personas.get(member.personaId)
             val name = member.displayName.ifBlank { persona?.name ?: "成员" }
 
+            val endpoint = resolver.resolve(member)
+            if (endpoint == null) {
+                onEvent(
+                    GroupEvent.MemberFailed(
+                        member.id,
+                        name,
+                        if (member.source == GroupMemberDef.SOURCE_PROVIDER)
+                            "绑定的 API 不可用（凭据缺失或该类型暂不支持），到群设置里改一下"
+                        else "免费通道未启用（设置 › 免费 Token 通道）",
+                    ),
+                )
+                continue
+            }
+
+            // 任务适配自检：只问一句「适合你吗」，不适合就不占用一轮发言
+            if (group.autoTaskFit && shouldSkip(endpoint, persona, name, text)) {
+                onEvent(GroupEvent.MemberSkipped(member.id, name, "判断这个任务不适合自己"))
+                store.appendMessage(
+                    GroupMessage(
+                        id = "msg_" + UUID.randomUUID().toString().take(8),
+                        groupId = groupId,
+                        role = "assistant",
+                        memberId = member.id,
+                        memberName = name,
+                        text = "（这个任务不适合我，本轮先不发言）",
+                        createdAt = System.currentTimeMillis(),
+                        skipped = true,
+                    ),
+                )
+                spoken += 1
+                continue
+            }
+
             onEvent(GroupEvent.MemberStarted(member.id, name))
             val reply = StringBuilder()
-            // 不能用 runCatching：它的 block 是普通 lambda，里面调不了挂起函数
+            val thinking = StringBuilder()
             var failure: Throwable? = null
             try {
                 streamMember(
-                    base = base,
+                    endpoint = endpoint,
                     persona = persona,
                     member = member,
+                    memberName = name,
                     history = history,
                     userText = text,
                     quote = quote,
-                ) { chunk ->
-                    reply.append(chunk)
-                    onEvent(GroupEvent.MemberDelta(member.id, chunk))
-                }
+                    onDelta = { chunk ->
+                        reply.append(chunk)
+                        onEvent(GroupEvent.MemberDelta(member.id, chunk))
+                    },
+                    onThinking = { chunk ->
+                        thinking.append(chunk)
+                        onEvent(GroupEvent.MemberThinking(member.id, chunk))
+                    },
+                )
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -178,7 +235,8 @@ class GroupChatEngine(
                     ),
                 )
             } else {
-                onEvent(GroupEvent.MemberFinished(member.id, name, reply.toString()))
+                val finalText = reply.toString().trim()
+                onEvent(GroupEvent.MemberFinished(member.id, name, finalText))
                 store.appendMessage(
                     GroupMessage(
                         id = "msg_" + UUID.randomUUID().toString().take(8),
@@ -186,8 +244,9 @@ class GroupChatEngine(
                         role = "assistant",
                         memberId = member.id,
                         memberName = name,
-                        text = reply.toString(),
+                        text = finalText.ifBlank { "（本轮没有输出）" },
                         createdAt = System.currentTimeMillis(),
+                        thinking = thinking.toString().trim().ifBlank { null },
                     ),
                 )
             }
@@ -198,27 +257,102 @@ class GroupChatEngine(
     private fun nameOf(members: List<GroupMemberDef>, id: String): String =
         members.firstOrNull { it.id == id }?.displayName?.takeIf { it.isNotBlank() } ?: id
 
+    // ---- 上下文构建 --------------------------------------------------------
+
+    /**
+     * 只喂「最终答复」。`thinking` 不参与构建——这就是「别的 AI 看不到你的思考过程」
+     * 的实现方式：不是靠提示词劝阻，而是根本不给。
+     */
+    private fun historyMessages(history: List<GroupMessage>, member: GroupMemberDef): JSONArray {
+        val arr = JSONArray()
+        history.forEach { m ->
+            if (m.isUser) {
+                arr.put(JSONObject().put("role", "user").put("content", m.text))
+            } else if (m.skipped) {
+                // 跳过也算一条公开事实，但不值得占篇幅
+            } else if (m.memberName != null) {
+                val same = m.memberId == member.id
+                val body = if (same) m.text else "【${m.memberName}】${m.text}"
+                arr.put(JSONObject().put("role", "assistant").put("content", body))
+            }
+        }
+        return arr
+    }
+
+    private fun systemPrompt(persona: Persona?, memberName: String, member: GroupMemberDef): String {
+        val effort = when (member.reasoning) {
+            "low" -> "回答尽量简短直接，不要展开推理。"
+            "high" -> "回答前充分推演，给出完整论证；但只输出最终答复，不要输出思考过程。"
+            else -> ""
+        }
+        return buildString {
+            val base = persona?.systemPrompt?.trim().orEmpty()
+            append(base.ifBlank { "你是一个可靠的中文助手。" })
+            append("\n\n你正在一个多人群聊里，以「$memberName」的身份发言。")
+            append("只输出你这一轮的发言内容，不要写「$memberName：」这样的前缀。")
+            append("你看不到其他成员的思考过程，也不要假装看过；")
+            append("其他成员的发言会以【名字】标注，需要时可以回应，但不要替他们说话。")
+            append("不要复述别人刚说过的话，直接给出你的观点或结果。")
+            if (effort.isNotBlank()) append("\n").append(effort)
+        }
+    }
+
+    // ---- 任务适配自检 ------------------------------------------------------
+
+    private suspend fun shouldSkip(
+        endpoint: MemberEndpoint,
+        persona: Persona?,
+        memberName: String,
+        task: String,
+    ): Boolean {
+        // 极短的消息（寒暄、追问）不做自检：既省一次调用，也避免把闲聊判成任务
+        if (task.trim().length < 12) return false
+        val system = buildString {
+            append("你在判断一个任务是否适合「$memberName」来做。")
+            val s = persona?.systemPrompt?.trim().orEmpty()
+            if (s.isNotBlank()) append("它的职责是：").append(s.take(400))
+            append("\n只回答一个词：SUITABLE 或 UNSUITABLE，不要解释。")
+        }
+        val body = JSONObject()
+            .put("model", endpoint.model)
+            .put("stream", false)
+            .put("temperature", 0.0)
+            .put("messages", JSONArray()
+                .put(JSONObject().put("role", "system").put("content", system))
+                .put(JSONObject().put("role", "user").put("content", "任务：${task.take(800)}")))
+        val answer = runCatching { callOnce(endpoint, body) }.getOrNull() ?: return false
+        return answer.contains("UNSUITABLE", ignoreCase = true)
+    }
+
+    private fun callOnce(endpoint: MemberEndpoint, body: JSONObject): String {
+        val req = Request.Builder()
+            .url("${endpoint.baseUrl}/chat/completions")
+            .post(body.toString().toRequestBody(jsonMedia))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer ${endpoint.apiKey}")
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code} ${text.take(200)}")
+            val choices = JSONObject(text).optJSONArray("choices") ?: return ""
+            return choices.optJSONObject(0)?.optJSONObject("message")?.optString("content").orEmpty()
+        }
+    }
+
+    // ---- 流式调用 ----------------------------------------------------------
+
     private suspend fun streamMember(
-        base: String,
+        endpoint: MemberEndpoint,
         persona: Persona?,
         member: GroupMemberDef,
+        memberName: String,
         history: List<GroupMessage>,
         userText: String,
         quote: GroupMessage?,
         onDelta: suspend (String) -> Unit,
+        onThinking: suspend (String) -> Unit,
     ) {
-        val messages = JSONArray()
-        history.forEach { m ->
-            if (m.isUser) {
-                messages.put(JSONObject().put("role", "user").put("content", m.text))
-            } else if (m.memberName != null) {
-                messages.put(
-                    JSONObject()
-                        .put("role", "assistant")
-                        .put("content", "【${m.memberName}】${m.text}"),
-                )
-            }
-        }
+        val messages = historyMessages(history, member)
         val current = buildString {
             if (quote != null && quote.memberName != null) {
                 append("【引用 ${quote.memberName} 的发言】\n")
@@ -229,25 +363,23 @@ class GroupChatEngine(
         }
         messages.put(JSONObject().put("role", "user").put("content", current))
 
-        val system = buildString {
-            append(persona?.systemPrompt?.trim().orEmpty())
-            if (isEmpty()) append("你是一个可靠的中文助手。")
-            append("\n\n你正在一个多人群聊里发言。")
-            append("只输出你这一轮的发言内容，不要写「${member.displayName}：」这样的前缀。")
-            append("其他成员的发言会以【名字】标注，你可以回应他们，但不要替他们说话。")
+        val full = JSONArray()
+        full.put(JSONObject().put("role", "system").put("content", systemPrompt(persona, memberName, member)))
+        for (i in 0 until messages.length()) {
+            messages.optJSONObject(i)?.let { full.put(it) }
         }
 
         val body = JSONObject()
-            .put("model", member.modelId)
+            .put("model", endpoint.model)
             .put("stream", true)
-            .put("messages", messages)
             .put("temperature", 0.7)
+            .put("messages", full)
 
         val req = Request.Builder()
-            .url("$base/chat/completions")
+            .url("${endpoint.baseUrl}/chat/completions")
             .post(body.toString().toRequestBody(jsonMedia))
             .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer local")
+            .header("Authorization", "Bearer ${endpoint.apiKey}")
             .build()
 
         http.newCall(req).execute().use { resp ->
@@ -269,6 +401,8 @@ class GroupChatEngine(
                 val delta = choices.optJSONObject(0)?.optJSONObject("delta") ?: continue
                 val piece = delta.optString("content", "")
                 if (piece.isNotEmpty()) onDelta(piece)
+                val reason = delta.optString("reasoning_content", "")
+                if (reason.isNotEmpty()) onThinking(reason)
             }
         }
     }
@@ -276,5 +410,8 @@ class GroupChatEngine(
     companion object {
         /** 单轮最多几个成员发言。免费池限速下，超过这个数基本只会换来 429。 */
         const val MAX_SPEAKERS = 3
+
+        /** 带进上下文的历史条数。群聊越长，越需要压住 token。 */
+        const val HISTORY_LIMIT = 24
     }
 }
