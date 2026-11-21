@@ -461,7 +461,7 @@ private fun MemberBubble(message: GroupMessage, member: GroupMemberDef?) {
                     text = message.memberName ?: "成员",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Medium,
-                    color = spec.color,
+                    color = Color(spec.color),
                 )
                 Text(
                     text = "  " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(message.createdAt)),
@@ -506,7 +506,7 @@ private fun StreamingBubble(name: String, spec: AvatarSpec, text: String, thinki
                     text = name,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Medium,
-                    color = spec.color,
+                    color = Color(spec.color),
                 )
                 Spacer(Modifier.width(6.dp))
                 CircularProgressIndicator(modifier = Modifier.size(11.dp), strokeWidth = 1.5.dp)
