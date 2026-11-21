@@ -31,6 +31,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -54,7 +55,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -76,6 +76,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -971,26 +972,35 @@ private fun Composer(
             }
             Spacer(Modifier.height(4.dp))
         }
-        OutlinedTextField(
+        // 文本输入用 BasicTextField：Material3 的 OutlinedTextField 自带
+        // 16dp 内边距且这个版本没有 contentPadding 参数，排出来比原版松一圈；
+        // 自己画 decorationBox 才能精确落到原版的 12×7。
+        BasicTextField(
             value = value,
             onValueChange = onValueChange,
             modifier = Modifier.fillMaxWidth(),
-            placeholder = {
-                Text(
-                    text = "发消息给群成员…",
-                    fontSize = 16.5.sp,
-                    color = ChatColors.primaryText.copy(alpha = 0.25f),
-                )
-            },
-            maxLines = 5,
-            textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.5.sp),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = Color.Transparent,
-                unfocusedBorderColor = Color.Transparent,
-                focusedContainerColor = Color.Transparent,
-                unfocusedContainerColor = Color.Transparent,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                fontSize = 16.5.sp,
+                color = ChatColors.primaryText,
             ),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+            cursorBrush = SolidColor(ChatColors.primaryText),
+            maxLines = 5,
+            decorationBox = { innerTextField ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                ) {
+                    if (value.isEmpty()) {
+                        Text(
+                            text = "发消息给群成员…",
+                            fontSize = 16.5.sp,
+                            color = ChatColors.primaryText.copy(alpha = 0.25f),
+                        )
+                    }
+                    innerTextField()
+                }
+            },
         )
         // Button row below text field（原版：左侧选图/选文件，右侧发送或停止）
         Row(
