@@ -22,6 +22,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,6 +62,20 @@ fun TokenHeatmapScreen(
     val windowTotals = remember(version) { heatmap.window(today) }
     val totalUsage = remember(version) { windowTotals.fold(TokenUsage.ZERO) { a, b -> a + b.usage } }
     val activeDays = remember(version) { windowTotals.count { it.tokens > 0 } }
+
+    // 页面开着时后台还在跑对话：新事件只改内存聚合，不会触发重组。
+    // 轮询 updatedAt，有新记账就 +1 版本号，格子才会实时变色。
+    var seenUpdatedAt by remember { mutableStateOf(heatmap.updatedAt) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(1500)
+            val at = heatmap.updatedAt
+            if (at != seenUpdatedAt) {
+                seenUpdatedAt = at
+                version += 1
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -118,7 +133,7 @@ fun TokenHeatmapScreen(
                 ExtRow("请求数", buckets.sumOf { it.requests }.toString())
                 if (buckets.any { it.hasUntrackedChannel }) {
                     Spacer(Modifier.height(6.dp))
-                    ExtCode("注意：含 web-anon 通道，该通道未提供 token 用量", tint = androidx.compose.ui.graphics.Color(0xFFFF9F0A))
+                    ExtCode("注意：含未上报 token 用量的通道，这部分数值按字符估算", tint = androidx.compose.ui.graphics.Color(0xFFFF9F0A))
                 }
             }
 
@@ -126,6 +141,13 @@ fun TokenHeatmapScreen(
                 ExtRow("总 Token", formatCount(totalUsage.total))
                 ExtRow("活跃天数", "$activeDays / 182")
                 ExtRow("已知模型", heatmap.knownModels().joinToString("、").ifBlank { "—" })
+                ExtRow(
+                    label = "最近记账",
+                    value = heatmap.updatedAt.takeIf { it > 0 }?.let {
+                        java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+                            .format(java.util.Date(it))
+                    } ?: "—",
+                )
             }
 
             ExtCard(

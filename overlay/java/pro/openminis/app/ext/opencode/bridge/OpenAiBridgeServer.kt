@@ -61,6 +61,16 @@ class OpenAiBridgeServer(
 
     private val seq = AtomicInteger(0)
 
+    /**
+     * 查用量专用的短超时客户端。
+     *
+     * 回复已经流完、只差 [DONE] 时去查会话；如果沿用 180 秒 readTimeout，
+     * 服务端一次卡顿就会让用户盯着「已经答完但还在转圈」。1.5 秒足够本地读一次。
+     */
+    private val usageHttp: OkHttpClient = http.newBuilder()
+        .callTimeout(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .build()
+
     val baseUrl: String get() = "http://127.0.0.1:$port"
 
     fun start(): Int {
@@ -240,6 +250,7 @@ class OpenAiBridgeServer(
         // 2.x 的模型是在建会话时选定的，所以先把 id 映射回 {id, providerID}
         val target = resolveModel(model)
         val client = OpencodeServerClient(http, svc) { log(it) }
+        val usageClient = OpencodeServerClient(usageHttp, svc) { log(it) }
         val sid = client.createSession(
             model = target,
             title = "minis-${System.currentTimeMillis()}",
@@ -336,41 +347,62 @@ class OpenAiBridgeServer(
                 failure = failure ?: (e.message ?: e.javaClass.simpleName)
             } finally {
                 watchdog.cancel()
-                client.deleteSession(sid)
+                // 会话不能在这里删：用量事件常常晚于结束事件，删掉就再也查不到
+                // tokens 了。放到下面「取用量之后」统一删。
             }
         }
 
+        // 结束事件先于用量事件到达是常态（实测里十次有九次如此）。先给瞬时事件
+        // 一点时间，再用会话信息里的最终 tokens 兜底；两条路都拿不到，才认定这个
+        // 通道确实没上报用量。
+        if (usageSeen == null) {
+            usageFetch@ for (attempt in 0 until 3) {
+                val fetched = runCatching { usageClient.sessionUsage(sid) }.getOrNull()
+                if (fetched != null && !fetched.isEmpty) {
+                    usageSeen = fetched
+                    log("用量从会话信息补齐：${fetched.total} tokens（model=$actualModel）")
+                    break@usageFetch
+                }
+                if (attempt < 2) runCatching { Thread.sleep(350L) }
+            }
+        }
+        // 最后的兜底：个别通道（以及被上游吞掉 usage 的网关）什么都不报。
+        // 这种情况下宁可给一个按字符估算的量级，也不要让用量页永远停在 0——
+        // 但要在热力图上标成「未上报」，别把估算当实测。
+        var estimatedUsage = false
+        val knownUsage = usageSeen
+        if ((knownUsage == null || knownUsage.isEmpty) && text.isNotBlank()) {
+            val est = estimateUsage(transcript, text.toString())
+            if (!est.isEmpty) {
+                usageSeen = est
+                estimatedUsage = true
+                log("通道未上报用量，按字符估算 ${est.total} tokens（model=$actualModel）")
+            }
+        }
+        runCatching { client.deleteSession(sid) }
+
         // 免费通道的真实用量进热力图。普通对话与群聊的免费成员都经过这里，
-        // 是「免费 token 不计入用量」的修复点。usage 缺席时也记一条请求
-        //（tokenReported=false，热力图会标注「该通道未提供用量」）。
+        // 是「免费 token 不计入用量」的修复点。
         runCatching {
             val u = usageSeen
-            if (u != null && !u.isEmpty) {
-                UsageCenter.record(
-                    UsageEvent(
-                        provider = "opencode",
-                        model = actualModel,
-                        usage = u,
-                        timestamp = System.currentTimeMillis(),
-                        sessionId = sid,
-                    ),
-                )
-            } else {
-                UsageCenter.record(
-                    UsageEvent(
-                        provider = "opencode",
-                        model = actualModel,
-                        usage = pro.openminis.app.ext.opencode.api.TokenUsage.ZERO,
-                        timestamp = System.currentTimeMillis(),
-                        sessionId = sid,
-                        tokenReported = false,
-                    ),
-                )
-            }
+            UsageCenter.record(
+                UsageEvent(
+                    provider = "opencode",
+                    model = actualModel,
+                    usage = u ?: pro.openminis.app.ext.opencode.api.TokenUsage.ZERO,
+                    timestamp = System.currentTimeMillis(),
+                    sessionId = sid,
+                    tokenReported = u != null && !u.isEmpty && !estimatedUsage,
+                ),
+            )
         }
 
         if (stream) {
             runCatching {
+                // 先补一个只带 usage、choices 为空的收尾块：Minis 的 OpenAI 解析器
+                // 会独立读取 usage 字段，据此把 token 写进消息、Token 用量页才算得到。
+                // 不补这一块，回复再正常，用量页也永远是 0。
+                usageSeen?.takeIf { !it.isEmpty }?.let { emitUsage(out, id, created, model, it) }
                 if (failure != null) {
                     out.write(
                         "data: ${JSONObject().put("error", JSONObject().put("message", failure)).toString()}\n\n"
@@ -409,6 +441,7 @@ class OpenAiBridgeServer(
                         .put("finish_reason", "stop"),
                 ),
             )
+        usageSeen?.takeIf { !it.isEmpty }?.let { resp.put("usage", usageJson(it)) }
         writeJson(out, 200, resp.toString())
     }
 
@@ -502,6 +535,64 @@ class OpenAiBridgeServer(
             }
         }
         return out.toString().trim().replace(Regex("\n{3,}"), "\n\n")
+    }
+
+    /** 通道完全不上报用量时的量级估算：中日韩字符按 1 token，其余按 4 字符 1 token。 */
+    private fun estimateUsage(transcript: String, reply: String): pro.openminis.app.ext.opencode.api.TokenUsage {
+        fun count(s: String): Long {
+            var cjk = 0L
+            var other = 0L
+            for (ch in s) {
+                val cp = ch.code
+                val wide = cp in 0x2E80..0x9FFF || cp in 0xAC00..0xD7AF || cp in 0xF900..0xFAFF
+                if (wide) cjk++ else other++
+            }
+            return cjk + other / 4
+        }
+        return pro.openminis.app.ext.opencode.api.TokenUsage(
+            input = count(transcript),
+            output = count(reply),
+        )
+    }
+
+    /** OpenAI 形状的 usage。prompt_tokens 必须含缓存部分，Minis 会再减回去。 */
+    private fun usageJson(usage: pro.openminis.app.ext.opencode.api.TokenUsage): JSONObject {
+        val prompt = usage.input + usage.cacheRead + usage.cacheWrite
+        val completion = usage.output
+        return JSONObject()
+            .put("prompt_tokens", prompt)
+            .put("completion_tokens", completion)
+            .put("total_tokens", prompt + completion)
+            .put(
+                "prompt_tokens_details",
+                JSONObject()
+                    .put("cached_tokens", usage.cacheRead)
+                    .put("cache_write_tokens", usage.cacheWrite),
+            )
+    }
+
+    /**
+     * 流末尾的用量块：`choices` 为空，只带 `usage`。
+     *
+     * OpenAI 的 `include_usage` 就是这个形状；Minis 的解析器对 choices 为空
+     * 的 chunk 只读 usage，不会当成空回复。少了这一块，Token 用量页就永远是 0。
+     */
+    private fun emitUsage(
+        out: OutputStream,
+        id: String,
+        created: Long,
+        model: String,
+        usage: pro.openminis.app.ext.opencode.api.TokenUsage,
+    ) {
+        val chunk = JSONObject()
+            .put("id", id)
+            .put("object", "chat.completion.chunk")
+            .put("created", created)
+            .put("model", model)
+            .put("choices", JSONArray())
+            .put("usage", usageJson(usage))
+        out.write("data: $chunk\n\n".toByteArray(Charsets.UTF_8))
+        out.flush()
     }
 
     private fun emitDelta(

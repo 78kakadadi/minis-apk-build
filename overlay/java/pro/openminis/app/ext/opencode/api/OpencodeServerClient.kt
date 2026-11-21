@@ -126,6 +126,27 @@ class OpencodeServerClient(
         }
     }
 
+    /**
+     * 读会话的累计用量。
+     *
+     * 为什么需要它：`session.usage.updated` 是瞬时事件，和
+     * `session.execution.succeeded` 的先后顺序并不稳定；桥接收到结束事件就立刻
+     * 断流时，用量事件经常还没到——表现就是「回复正常，热力图/用量页全是 0」。
+     * 会话信息里的 `tokens` 是落库后的最终值，结束时查一次最可靠。
+     */
+    fun sessionUsage(sessionId: String): TokenUsage? {
+        val req = Request.Builder()
+            .url("${svc.baseUrl}/api/session/$sessionId")
+            .header("Authorization", svc.authorization)
+            .get()
+            .build()
+        return http.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) return null
+            OpencodeUsage.fromSessionResponse(text)
+        }
+    }
+
     /** 尽力删除：删不掉只是服务端多留一条空会话，不影响本次回复。 */
     fun deleteSession(sessionId: String) {
         val req = Request.Builder()
@@ -230,17 +251,11 @@ class OpencodeServerClient(
             }
             "session.execution.cancelled" -> listOf(StreamEvent.Finished("aborted"))
             "session.usage.updated" -> {
-                val t = data.optJSONObject("tokens")
-                if (t == null) emptyList() else listOf(
-                    StreamEvent.UsageTotal(
-                        TokenUsage(
-                            input = t.optLong("input"),
-                            output = t.optLong("output"),
-                            cacheRead = t.optJSONObject("cache")?.optLong("read") ?: 0,
-                            cacheWrite = t.optJSONObject("cache")?.optLong("write") ?: 0,
-                        ),
-                    ),
-                )
+                // tokens 的形状与 GET /api/session 里的一致，共用一个解析器：
+                // reasoning 要并进 output，否则热力图比 OpenCode 自己少算一截。
+                OpencodeUsage.parse(data.optJSONObject("tokens"))?.let {
+                    listOf(StreamEvent.UsageTotal(it))
+                } ?: emptyList()
             }
             // ---- 工具调用 ------------------------------------------------------
             // 免费模型会真的用 shell / read / write / webfetch 等工具干活，
