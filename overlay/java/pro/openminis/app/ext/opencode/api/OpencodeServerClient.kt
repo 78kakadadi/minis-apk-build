@@ -11,6 +11,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import pro.openminis.app.ext.opencode.model.FreeModel
 import pro.openminis.app.ext.opencode.runtime.ServiceConfig
@@ -168,15 +169,19 @@ class OpencodeServerClient(
                 emit(StreamEvent.Started)
                 val source = resp.body?.source() ?: throw IOException("/api/event 响应没有 body")
                 val parser = SseFrameParser()
+                // 工具事件的 name/入参分散在三个事件里（input.started / input.ended /
+                // success|failed），success 只带 id 和输出。必须自己记住 id → 名字/入参，
+                // 否则卡片只能显示一堆 call id。
+                val tools = ToolTracker()
                 while (true) {
                     val line = source.readUtf8Line() ?: break
                     currentCoroutineContext().ensureActive()
                     for (frame in parser.feed("$line\n")) {
-                        for (ev in mapFrame(frame, sessionId)) emit(ev)
+                        for (ev in mapFrame(frame, sessionId, tools)) emit(ev)
                     }
                 }
                 for (frame in parser.finish()) {
-                    for (ev in mapFrame(frame, sessionId)) emit(ev)
+                    for (ev in mapFrame(frame, sessionId, tools)) emit(ev)
                 }
             }
             currentCoroutineContext().ensureActive()
@@ -186,7 +191,11 @@ class OpencodeServerClient(
         }
     }.flowOn(Dispatchers.IO)
 
-    private fun mapFrame(frame: pro.openminis.app.ext.opencode.sse.SseFrame, sessionId: String): List<StreamEvent> {
+    private fun mapFrame(
+        frame: pro.openminis.app.ext.opencode.sse.SseFrame,
+        sessionId: String,
+        tools: ToolTracker,
+    ): List<StreamEvent> {
         if (frame.isHeartbeat || frame.data.isBlank()) return emptyList()
         val root = try {
             JSONObject(frame.data)
@@ -233,9 +242,93 @@ class OpencodeServerClient(
                     ),
                 )
             }
-            // text.started / text.ended / step.* / inbox.* / renamed / instructions.*
-            // 对 OpenAI 兼容输出没有意义，忽略（text.ended 与 delta 重复）
+            // ---- 工具调用 ------------------------------------------------------
+            // 免费模型会真的用 shell / read / write / webfetch 等工具干活，
+            // 2.x 把这些过程单独发事件流。以前这里全部丢掉，用户只能看到
+            // 「想了很久 → 一个答案」，完全不知道中间跑了什么命令。
+            "session.tool.input.started" -> {
+                val id = data.optString("id")
+                val name = data.optString("name").ifBlank { "tool" }
+                if (id.isBlank()) emptyList() else {
+                    tools.name[id] = name
+                    listOf(StreamEvent.ToolStart(id, name))
+                }
+            }
+            "session.tool.input.ended" -> {
+                val id = data.optString("id")
+                val args = data.optString("text")
+                if (id.isBlank()) emptyList() else {
+                    tools.args[id] = args
+                    listOf(StreamEvent.ToolInputDelta(id, args))
+                }
+            }
+            "session.tool.called" -> {
+                // input 对象比 input.ended 的 text 更完整（有些工具边 stream 边补字段）
+                val id = data.optString("id")
+                val input = data.optJSONObject("input")
+                if (id.isBlank() || input == null) emptyList() else {
+                    tools.args[id] = input.toString()
+                    emptyList()
+                }
+            }
+            "session.tool.success" -> {
+                val id = data.optString("id")
+                if (id.isBlank()) emptyList() else listOf(
+                    StreamEvent.ToolSettled(
+                        callId = id,
+                        name = tools.name[id] ?: "tool",
+                        argsJson = tools.args[id].orEmpty(),
+                        outputPreview = toolOutput(data.optJSONArray("content")),
+                        isError = false,
+                    ),
+                )
+            }
+            "session.tool.failed" -> {
+                val id = data.optString("id")
+                if (id.isBlank()) emptyList() else {
+                    val err = data.optJSONObject("error")
+                    val msg = err?.optString("message")?.takeIf { it.isNotBlank() }
+                        ?: err?.optString("type").orEmpty().ifBlank { "工具执行失败" }
+                    listOf(
+                        StreamEvent.ToolSettled(
+                            callId = id,
+                            name = tools.name[id] ?: "tool",
+                            argsJson = tools.args[id].orEmpty(),
+                            outputPreview = msg,
+                            isError = true,
+                        ),
+                    )
+                }
+            }
+            // progress 只带 shellID 之类的元数据，没有可展示内容
             else -> emptyList()
         }
+    }
+
+    /** 把 success 事件的 content 数组拼成纯文本（非 text 部分跳过）。 */
+    private fun toolOutput(content: JSONArray?): String {
+        if (content == null) return ""
+        val sb = StringBuilder()
+        for (i in 0 until content.length()) {
+            val part = content.optJSONObject(i) ?: continue
+            if (part.optString("type") != "text") continue
+            val t = part.optString("text")
+            if (t.isBlank()) continue
+            if (sb.isNotEmpty()) sb.append('\n')
+            sb.append(t)
+        }
+        return sb.toString()
+    }
+
+    /**
+     * 工具 id → 名字/入参。
+     *
+     * opencode 的 `session.tool.success` 只发 `{id, content}`，名字与入参在
+     * 前面的 `input.started` / `input.ended` 里。没有这张表，卡片就只能显示
+     * `chatcmpl-tool-a6a9eb09…` 这种 id，等于还是看不见。
+     */
+    private class ToolTracker {
+        val name = HashMap<String, String>(4)
+        val args = HashMap<String, String>(4)
     }
 }

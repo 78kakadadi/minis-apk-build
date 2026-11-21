@@ -292,6 +292,19 @@ class OpenAiBridgeServer(
                             // OpenAI 客户端不认识这个字段，但自家的群聊引擎会读
                             if (stream) emitDelta(out, id, created, model, null, null, ev.text)
                         }
+                        is StreamEvent.ToolSettled -> {
+                            // 工具是 opencode 在设备上真跑完的（shell/read/write…），
+                            // 我们只把「跑了什么、结果是什么」当正文渲染出来给用户看。
+                            // 绝不能翻成 tool_calls：那会让 Minis 的 agent loop 再执行
+                            // 一遍同名工具，等于 rm 跑两次。
+                            val block = renderToolBlock(ev)
+                            if (block.isNotEmpty()) {
+                                // 工具先于正文时，别让消息以两个空行开头
+                                val piece = if (text.isEmpty()) block.trimStart() else block
+                                text.append(piece)
+                                if (stream) emitDelta(out, id, created, model, piece, null, null)
+                            }
+                        }
                         is StreamEvent.Finished -> {
                             finished = true
                             if (stream) emitDelta(out, id, created, model, null, ev.stopReason, null)
@@ -387,6 +400,96 @@ class OpenAiBridgeServer(
 
     private class StopStream : RuntimeException()
 
+    // ---- 工具调用展示 -----------------------------------------------------
+
+    /**
+     * 把一次工具调用渲染成可见的 markdown 块。
+     *
+     * ## 为什么走正文，而不是 OpenAI 的 `tool_calls`
+     *
+     * Minis 收到 `tool_calls` 会把工具塞进自己的 agent loop 排队执行。
+     * 但免费通道的工具是 opencode 在设备上**已经跑完**的（shell/read/write…），
+     * 再发一次 tool_calls 就是双重执行：`ls` 跑两遍、`edit` 改两遍、
+     * 带副作用的命令直接出事。所以这里只做「展示」：把工具名、入参、
+     * 输出当 markdown 追加到回复正文里，用户能看见，agent loop 不碰。
+     */
+    private fun renderToolBlock(ev: StreamEvent.ToolSettled): String {
+        val name = ev.name.ifBlank { "tool" }
+        val arg = summarizeArgs(ev.argsJson)
+        val head = buildString {
+            append("🛠 **").append(name).append("**")
+            if (arg.isNotBlank()) append(" · `").append(arg).append("`")
+            if (ev.isError) append(" · 失败")
+        }
+        val out = ev.outputPreview.orEmpty().trimEnd()
+        if (out.isBlank()) return "\n\n$head\n\n"
+
+        val lines = out.lines()
+        val clipped = lines.take(MAX_TOOL_LINES).joinToString("\n").take(MAX_TOOL_CHARS)
+        val truncated = clipped.length < out.length
+        return buildString {
+            append("\n\n").append(head).append("\n\n")
+            append("```text\n").append(clipped).append("\n```")
+            if (truncated) append("\n（输出较长，已截断）")
+            append("\n\n")
+        }
+    }
+
+    /** 从入参 JSON 里挑一个最能说明「在干什么」的字段，压成一行。 */
+    private fun summarizeArgs(argsJson: String): String {
+        if (argsJson.isBlank()) return ""
+        val obj = runCatching { JSONObject(argsJson) }.getOrNull()
+        val raw = if (obj != null) {
+            listOf("command", "path", "filePath", "file_path", "pattern", "url", "query", "tool_title")
+                .firstNotNullOfOrNull { k -> obj.optString(k).takeIf { it.isNotBlank() } }
+                ?: obj.toString()
+        } else argsJson
+        return raw.replace('\n', ' ').replace('`', '\'').trim().take(MAX_ARG_CHARS)
+    }
+
+    /**
+     * 把历史回复里的工具块剥掉。
+     *
+     * 这些块是给用户看的，不该当成「助手说过的话」再喂回模型——一轮 shell 输出
+     * 几百行，塞进上下文除了浪费 token 没别的用。只处理助手消息。
+     */
+    private fun stripToolBlocks(text: String): String {
+        if (!text.contains("🛠 ")) return text
+        val lines = text.lines()
+        val out = StringBuilder()
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i]
+            if (!line.trimStart().startsWith("🛠 ")) {
+                out.append(line).append('\n')
+                i++
+                continue
+            }
+            // 进入工具块：跳过标题行，再看紧跟的是不是围栏代码块
+            i++
+            var fences = 0
+            var consumedFence = false
+            while (i < lines.size) {
+                val t = lines[i].trimStart()
+                if (t.startsWith("```")) {
+                    consumedFence = true
+                    fences++
+                    i++
+                    if (fences >= 2) break
+                    continue
+                }
+                if (!consumedFence) {
+                    // 标题与围栏之间有空行；无输出的工具块则直接跟正文。
+                    if (t.isBlank()) { i++; continue }
+                    // 遇到正文：这一行要保留，不能吞掉
+                    break
+                }
+                i++
+            }
+        }
+        return out.toString().trim().replace(Regex("\n{3,}"), "\n\n")
+    }
+
     private fun emitDelta(
         out: OutputStream,
         id: String,
@@ -436,7 +539,7 @@ class OpenAiBridgeServer(
                     }
                 }
                 "user" -> turns.append("【用户】").append(content).append("\n")
-                "assistant" -> turns.append("【助手】").append(content).append("\n")
+                "assistant" -> turns.append("【助手】").append(stripToolBlocks(content)).append("\n")
                 "tool" -> turns.append("【工具结果】").append(content.take(2000)).append("\n")
                 else -> Unit
             }
@@ -483,5 +586,12 @@ class OpenAiBridgeServer(
          * 所以 readTimeout 在这条路径上失效，只能靠它。
          */
         const val IDLE_TIMEOUT_MS = 90_000L
+
+        /** 工具输出最多展示的行数/字符数：`read` 一个文件就是几百行，全贴没法看。 */
+        const val MAX_TOOL_LINES = 24
+        const val MAX_TOOL_CHARS = 1_500
+
+        /** 工具入参摘要的长度上限。 */
+        const val MAX_ARG_CHARS = 110
     }
 }
