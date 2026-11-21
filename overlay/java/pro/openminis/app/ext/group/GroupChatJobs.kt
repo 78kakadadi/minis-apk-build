@@ -2,6 +2,7 @@ package pro.openminis.app.ext.group
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -37,7 +38,10 @@ object GroupChatJobs {
 
     fun launch(groupId: String, block: suspend () -> Unit): Job {
         running.remove(groupId)?.cancel()
-        val job = scope.launch {
+        // 先建一个不启动的 job、放进表里再 start：如果反过来（先 start 再 put），
+        // 任务可能在 put 之前就跑完，finally 里的 remove 删不到自己，表里留下
+        // 一个永远「已完成」的 job —— 之后 isRunning 判断会错。
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 block()
             } catch (e: CancellationException) {
@@ -47,6 +51,7 @@ object GroupChatJobs {
             }
         }
         running[groupId] = job
+        job.start()
         return job
     }
 

@@ -1,6 +1,8 @@
 package pro.openminis.app.ext.group
 
 import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -44,6 +46,17 @@ data class GroupMemberDef(
      * 「用户主动关掉全部」和「从没设置过」，升级后会静默把工具关掉。
      */
     val tools: List<String>? = null,
+    /**
+     * 允许这个成员使用的技能 id（上游 SkillRepository 的 skill.id）。
+     *
+     * `null` = 没设置过，等价于「已启用的技能全部可用」——和普通对话的行为一致；
+     * 显式空列表表示「这个成员不加载任何技能」。
+     *
+     * 技能不会把整篇 SKILL.md 塞进提示词（几十个技能会直接顶爆上下文），而是：
+     * 提示词里只给「名字 + 一句话描述 + 工作区里的路径」，模型真要用时用
+     * read_file 去读正文。两种来源的成员都走同一条路。
+     */
+    val skills: List<String>? = null,
     /** 头像字母（留空则按模型自动取厂商标识）。 */
     val avatarLabel: String = "",
     /** 头像底色 ARGB（0 = 按模型自动配色）。 */
@@ -52,6 +65,31 @@ data class GroupMemberDef(
     companion object {
         const val SOURCE_FREE = "free"
         const val SOURCE_PROVIDER = "provider"
+    }
+}
+
+/**
+ * 一条消息附件。
+ *
+ * [path] 是应用私有目录里的绝对路径（`filesDir/minis-ext/groups/<gid>/attachments/`），
+ * 不进系统相册、也不会被别的应用读到。发出去的是副本：用户在相册里删掉原图，
+ * 群聊里的记录仍然完整。
+ */
+data class GroupAttachment(
+    val id: String,
+    val groupId: String,
+    /** [KIND_IMAGE] 或 [KIND_FILE]。 */
+    val kind: String,
+    val name: String,
+    val mime: String,
+    val path: String,
+    val size: Long = 0L,
+) {
+    val isImage: Boolean get() = kind == KIND_IMAGE
+
+    companion object {
+        const val KIND_IMAGE = "image"
+        const val KIND_FILE = "file"
     }
 }
 
@@ -79,6 +117,8 @@ data class GroupMessage(
      * 界面上有活跃的流式气泡时这些草稿会被隐藏，避免同一条回复出现两次。
      */
     val streaming: Boolean = false,
+    /** 这条消息带的附件（图片 / 文件）。目前只有用户消息会有。 */
+    val attachments: List<GroupAttachment> = emptyList(),
 ) {
     val isUser: Boolean get() = role == "user"
 }
@@ -92,7 +132,8 @@ data class GroupMessage(
  */
 class GroupStore(context: Context) {
 
-    private val dir = File(context.filesDir, "minis-ext/groups")
+    private val app: Context = context.applicationContext
+    private val dir = File(app.filesDir, "minis-ext/groups")
     private val indexFile = File(dir, "groups.json")
 
     init {
@@ -111,6 +152,33 @@ class GroupStore(context: Context) {
 
     private companion object {
         val LOCK = Any()
+
+        /** 单个附件上限。手机拍的 4K 照片约 5 MB，留出余量。 */
+        const val MAX_ATTACHMENT_BYTES = 32L * 1024 * 1024
+
+        val IMAGE_EXTS = setOf("png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp")
+
+        fun readAttachments(o: JSONObject): List<GroupAttachment> {
+            val arr = o.optJSONArray("attachments") ?: return emptyList()
+            val out = ArrayList<GroupAttachment>(arr.length())
+            for (i in 0 until arr.length()) {
+                val a = arr.optJSONObject(i) ?: continue
+                val path = a.optString("path")
+                if (path.isBlank()) continue
+                out.add(
+                    GroupAttachment(
+                        id = a.optString("id"),
+                        groupId = a.optString("groupId"),
+                        kind = a.optString("kind").ifBlank { GroupAttachment.KIND_FILE },
+                        name = a.optString("name"),
+                        mime = a.optString("mime"),
+                        path = path,
+                        size = a.optLong("size"),
+                    ),
+                )
+            }
+            return out
+        }
     }
 
     // ---- 群 ---------------------------------------------------------------
@@ -216,10 +284,17 @@ class GroupStore(context: Context) {
                 providerInstanceId = o.optString("providerInstanceId"),
                 reasoning = o.optString("reasoning").ifBlank { "medium" },
                 tools = o.optJSONArray("tools")?.let { arr ->
-                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+                    (0 until arr.length()).mapNotNull { i ->
+                        arr.optString(i).takeIf { it.isNotBlank() }
+                    }
                 },
                 avatarLabel = o.optString("avatarLabel"),
                 avatarColor = o.optInt("avatarColor", 0),
+                skills = o.optJSONArray("skills")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { i ->
+                        arr.optString(i).takeIf { it.isNotBlank() }
+                    }
+                },
             )
         }.filter { it.groupId == groupId && it.id.isNotBlank() }
 
@@ -269,6 +344,8 @@ class GroupStore(context: Context) {
         }
         o.put("avatarLabel", member.avatarLabel)
         o.put("avatarColor", member.avatarColor)
+        val skills = member.skills
+        if (skills == null) o.remove("skills") else o.put("skills", JSONArray(skills))
     }
 
     fun updateMember(memberId: String, block: (JSONObject) -> Unit) {
@@ -308,6 +385,12 @@ class GroupStore(context: Context) {
         updateMember(memberId) {
             it.put("avatarLabel", label)
             it.put("avatarColor", color)
+        }
+
+    /** 与 [setMemberTools] 同语义：`null` = 全部已启用技能，空列表 = 一个都不用。 */
+    fun setMemberSkills(memberId: String, skills: List<String>?) =
+        updateMember(memberId) {
+            if (skills == null) it.remove("skills") else it.put("skills", JSONArray(skills))
         }
 
     fun setMemberModel(
@@ -361,6 +444,7 @@ class GroupStore(context: Context) {
                 skipped = o.optBoolean("skipped", false),
                 interrupted = o.optBoolean("interrupted", false),
                 streaming = o.optBoolean("streaming", false),
+                attachments = readAttachments(o),
             )
         }
     }
@@ -433,6 +517,86 @@ class GroupStore(context: Context) {
         }
     }
 
+    // ---- 附件 -------------------------------------------------------------
+
+    fun attachmentsDir(groupId: String): File =
+        File(File(dir, groupId), "attachments").apply { if (!exists()) mkdirs() }
+
+    /**
+     * 把用户选中的图片 / 文件复制进应用私有目录。
+     *
+     * 用 ContentResolver 流式复制而不是 `readBytes()`：用户可能选一个几百 MB 的
+     * 视频，整段读进内存会直接被系统杀掉。超过 [MAX_ATTACHMENT_BYTES] 直接拒绝，
+     * 并把原因交给调用方展示。
+     */
+    fun importAttachment(groupId: String, uri: Uri): Result<GroupAttachment> = runCatching {
+        val resolver = app.contentResolver
+        var name = ""
+        var size = 0L
+        runCatching {
+            resolver.query(uri, null, null, null, null)?.use { c ->
+                val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                if (c.moveToFirst()) {
+                    if (nameIdx >= 0) name = c.getString(nameIdx).orEmpty()
+                    if (sizeIdx >= 0) size = c.getLong(sizeIdx)
+                }
+            }
+        }
+        val mime = resolver.getType(uri).orEmpty()
+        if (name.isBlank()) name = uri.lastPathSegment?.substringAfterLast('/').orEmpty()
+        if (name.isBlank()) name = "附件"
+        val ext = name.substringAfterLast('.', "").lowercase()
+        val kind = if (mime.startsWith("image/") || ext in IMAGE_EXTS) {
+            GroupAttachment.KIND_IMAGE
+        } else {
+            GroupAttachment.KIND_FILE
+        }
+        val id = "att_" + UUID.randomUUID().toString().take(8)
+        val safe = name.replace(Regex("[\\\\/:*?\"<>|\\s]+"), "_").take(60).ifBlank { "file" }
+        val target = File(attachmentsDir(groupId), "${id}_$safe")
+        val written = resolver.openInputStream(uri)?.use { input ->
+            target.outputStream().use { out ->
+                val buf = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    total += n
+                    if (total > MAX_ATTACHMENT_BYTES) {
+                        out.flush()
+                        target.delete()
+                        throw IllegalArgumentException("附件超过 ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB 上限")
+                    }
+                    out.write(buf, 0, n)
+                }
+                total
+            }
+        } ?: throw IllegalArgumentException("读不到这个文件（权限被收回？）")
+        GroupAttachment(
+            id = id,
+            groupId = groupId,
+            kind = kind,
+            name = name,
+            mime = if (mime.isBlank()) guessMime(ext) else mime,
+            path = target.absolutePath,
+            size = if (size > 0) size else written,
+        )
+    }
+
+    private fun guessMime(ext: String): String = when (ext) {
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "heic" -> "image/heic"
+        "pdf" -> "application/pdf"
+        "txt", "md", "log" -> "text/plain"
+        "json" -> "application/json"
+        "csv" -> "text/csv"
+        else -> "application/octet-stream"
+    }
+
     // ---- 内部 -------------------------------------------------------------
 
     private fun messagesFile(groupId: String) = File(dir, "$groupId.messages.json")
@@ -463,6 +627,27 @@ class GroupStore(context: Context) {
         .put("skipped", message.skipped)
         .put("interrupted", message.interrupted)
         .put("streaming", message.streaming)
+        .apply {
+            if (message.attachments.isNotEmpty()) {
+                put(
+                    "attachments",
+                    JSONArray().apply {
+                        message.attachments.forEach { a ->
+                            put(
+                                JSONObject()
+                                    .put("id", a.id)
+                                    .put("groupId", a.groupId)
+                                    .put("kind", a.kind)
+                                    .put("name", a.name)
+                                    .put("mime", a.mime)
+                                    .put("path", a.path)
+                                    .put("size", a.size),
+                            )
+                        }
+                    },
+                )
+            }
+        }
 
     /**
      * 先写临时文件再改名。

@@ -1,5 +1,10 @@
 package pro.openminis.app.ui.opencode
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -18,6 +23,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -56,26 +62,34 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import pro.openminis.app.MinisApp
 import pro.openminis.app.ext.group.AiAvatars
 import pro.openminis.app.ext.group.AvatarSpec
+import pro.openminis.app.ext.group.GroupAttachment
 import pro.openminis.app.ext.group.GroupChatEngine
 import pro.openminis.app.ext.group.GroupChatJobs
 import pro.openminis.app.ext.group.GroupDef
 import pro.openminis.app.ext.group.GroupEvent
 import pro.openminis.app.ext.group.GroupMemberDef
 import pro.openminis.app.ext.group.GroupMessage
+import pro.openminis.app.ext.group.GroupSkill
+import pro.openminis.app.ext.group.GroupSkillSource
+import pro.openminis.app.ext.group.GroupSkills
 import pro.openminis.app.ext.group.GroupStore
 import pro.openminis.app.ext.group.GroupTools
 import pro.openminis.app.ext.group.TurnStrategy
@@ -86,9 +100,11 @@ import pro.openminis.app.ext.persona.PersonaFileStore
 import pro.openminis.app.ext.persona.PersonaRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -145,6 +161,11 @@ fun GroupChatScreen(
             http = http,
             // 与免费通道共用同一个工作区：两种来源的成员看到的是同一批文件
             workspace = File(appContext.filesDir, "opencode/workspace"),
+            // 每次发言现场问一次技能仓库：技能随时可能在设置里被启停，
+            // 缓存一份反而会拿到过期的列表。
+            skills = GroupSkillSource { availableSkills(appContext) },
+            // 图片压成 JPEG 再 base64；不压缩的话一张 4K 照片就能让请求体超限。
+            encodeImage = { file -> encodeImageForRequest(file) },
         )
     }
 
@@ -161,7 +182,10 @@ fun GroupChatScreen(
     }
 
     var input by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
+    // 任务在进程级 scope 里跑，界面的按钮状态以「任务还活着吗」为准，初始值也照此取：
+    // 从别处切回来时如果还在生成，一进来就该是停止键。
+    var busy by remember { mutableStateOf(currentId?.let { GroupChatJobs.isRunning(it) } == true) }
+    var attachments by remember { mutableStateOf<List<GroupAttachment>>(emptyList()) }
     var pending by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var thinking by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var status by remember { mutableStateOf("") }
@@ -212,20 +236,48 @@ fun GroupChatScreen(
 
     val listState = rememberLazyListState()
 
-    // 进群/切回时如果这一轮还在跑（任务在进程级 scope 里，不跟界面一起死），
-    // 跟着磁盘上的进度刷新，直到跑完。这就是「退出界面再回来还能看到回复」。
+    // 一直「照镜子」：按钮状态与刷新都由进程级任务的真实状态驱动。
+    //
+    // 以前 busy 全靠每次发送自己 finally 去清，有两个坑：
+    //  - 上一轮被取消后 finally 还没跑完，新一轮已经开始，finally 会把停止键
+    //    错设回发送键，于是「正输出时按不到停止」；
+    //  - 停止时任务卡在落盘上，界面就一直转圈，看起来像「暂停没生效」。
+    // 现在只看 isRunning：取消后最多 400ms 内一定回到可输入状态。
     LaunchedEffect(currentId) {
         val gid = currentId ?: return@LaunchedEffect
-        if (GroupChatJobs.isRunning(gid)) {
-            busy = true
-            while (GroupChatJobs.isRunning(gid)) {
+        while (true) {
+            val running = GroupChatJobs.isRunning(gid)
+            if (running != busy) busy = running
+            if (running) {
+                // 生成中跟着磁盘上的草稿刷新（退出再回来也能看到进度）
                 version++
-                kotlinx.coroutines.delay(700)
+                delay(700)
+            } else {
+                if (pending.isNotEmpty() || thinking.isNotEmpty()) {
+                    pending = emptyMap()
+                    thinking = emptyMap()
+                    version++
+                }
+                delay(400)
             }
-            busy = false
-            pending = emptyMap()
-            thinking = emptyMap()
-            version++
+        }
+    }
+
+    // 选图片 / 选文件：复制进应用私有目录，群聊记录不依赖相册里那张原图。
+    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val gid = currentId
+        if (uri != null && gid != null) {
+            store.importAttachment(gid, uri)
+                .onSuccess { attachments = attachments + it }
+                .onFailure { status = "添加图片失败：${it.message}" }
+        }
+    }
+    val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val gid = currentId
+        if (uri != null && gid != null) {
+            store.importAttachment(gid, uri)
+                .onSuccess { attachments = attachments + it }
+                .onFailure { status = "添加文件失败：${it.message}" }
         }
     }
 
@@ -318,15 +370,19 @@ fun GroupChatScreen(
                                 {
                                     status = ""
                                     busy = true
-                                    GroupChatJobs.launch(retryGroupId) {
-                                        try {
-                                            engine.retryMember(retryGroupId, m.memberId!!, handleEvent)
-                                        } finally {
-                                            withContext(NonCancellable + Dispatchers.Main) {
-                                                busy = false
-                                                pending = emptyMap()
-                                                thinking = emptyMap()
-                                                version++
+                                    val mid = m.memberId
+                                    if (mid != null) {
+                                        GroupChatJobs.launch(retryGroupId) {
+                                            // 以前这里只有 finally：重试真要抛异常（比如端点 400），
+                                            // 界面什么都不会显示，看起来就是「按钮点了没反应」。
+                                            try {
+                                                engine.retryMember(retryGroupId, mid, handleEvent)
+                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                throw e
+                                            } catch (e: Exception) {
+                                                withContext(Dispatchers.Main) {
+                                                    status = "重试失败：${e.message ?: e.javaClass.simpleName}"
+                                                }
                                             }
                                         }
                                     }
@@ -364,15 +420,26 @@ fun GroupChatScreen(
                 onValueChange = { input = it },
                 quote = quote,
                 onClearQuote = { quote = null },
+                attachments = attachments,
+                onRemoveAttachment = { a -> attachments = attachments.filterNot { it.id == a.id } },
+                onPickImage = { pickImage.launch("image/*") },
+                onPickFile = { pickFile.launch("*/*") },
                 busy = busy,
                 bridgeReady = manager.bridgeBaseUrl != null || members.any {
                     it.source == GroupMemberDef.SOURCE_PROVIDER
                 },
-                onStop = { GroupChatJobs.cancel(sendGroupId) },
+                onStop = {
+                    // 只管发取消信号：界面状态由上面那个轮询照镜子清，
+                    // 这里先给一句反馈，用户能看到「点了真有反应」。
+                    GroupChatJobs.cancel(sendGroupId)
+                    status = "已停止"
+                },
                 onSend = {
                     val text = input.trim()
-                    if (text.isNotEmpty() && !busy) {
+                    val files = attachments
+                    if ((text.isNotEmpty() || files.isNotEmpty()) && !busy) {
                         input = ""
+                        attachments = emptyList()
                         status = ""
                         busy = true
                         pending = emptyMap()
@@ -381,12 +448,19 @@ fun GroupChatScreen(
                         quote = null
                         GroupChatJobs.launch(sendGroupId) {
                             try {
-                                engine.send(sendGroupId, text, q, handleEvent)
+                                engine.send(sendGroupId, text, q, files, handleEvent)
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                // 兜底：引擎内部已经把单个成员的失败收成消息了，
+                                // 能走到这里的只有「整轮都没跑起来」这种意外。
+                                withContext(Dispatchers.Main) {
+                                    status = "发送失败：${e.message ?: e.javaClass.simpleName}"
+                                }
                             } finally {
                                 // 被「停止」取消时 withContext 本身会立刻抛，必须 NonCancellable，
-                                // 否则 busy 一直为 true，发送键永远停在停止态。
+                                // 否则清理逻辑不会执行。
                                 withContext(NonCancellable + Dispatchers.Main) {
-                                    busy = false
                                     pending = emptyMap()
                                     thinking = emptyMap()
                                     version++
@@ -406,6 +480,7 @@ fun GroupChatScreen(
             personas = personas,
             freeModels = freeModels.map { it.id to it.label },
             providerChoices = remember(showSettings, version) { resolver.providerChoices() },
+            skills = remember(showSettings, version) { availableSkills(appContext) },
             onDismiss = { showSettings = false },
             onChange = { version++ },
             onDeleteGroup = {
@@ -511,13 +586,90 @@ private fun UserBubble(message: GroupMessage) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Surface(color = GC_BLUE, shape = RoundedCornerShape(14.dp)) {
-            Text(
-                text = message.text,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color.White,
+        // 图片按发送顺序排在文字上方：群聊里最常看的是图本身，不是说明文字
+        message.attachments.filter { it.isImage }.forEach { a ->
+            AttachmentImage(
+                attachment = a,
+                modifier = Modifier
+                    .padding(vertical = 2.dp)
+                    .widthIn(max = 230.dp)
+                    .heightIn(max = 220.dp),
             )
+        }
+        message.attachments.filterNot { it.isImage }.forEach { a ->
+            AttachmentFileChip(a, Modifier.padding(vertical = 2.dp))
+        }
+        if (message.text.isNotBlank()) {
+            Surface(color = GC_BLUE, shape = RoundedCornerShape(14.dp)) {
+                Text(
+                    text = message.text,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White,
+                )
+            }
+        }
+    }
+}
+
+/** 聊天里显示一张图片。解码放到 IO 线程，避免大图把主线程卡住。 */
+@Composable
+private fun AttachmentImage(attachment: GroupAttachment, modifier: Modifier = Modifier) {
+    val bitmap by produceState<Bitmap?>(null, attachment.path) {
+        value = withContext(Dispatchers.IO) { decodeThumbnail(attachment.path, 720) }
+    }
+    val bmp = bitmap
+    if (bmp != null) {
+        Image(
+            bitmap = bmp.asImageBitmap(),
+            contentDescription = attachment.name,
+            modifier = modifier.clip(RoundedCornerShape(12.dp)),
+            contentScale = ContentScale.Fit,
+        )
+    } else {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            shape = RoundedCornerShape(10.dp),
+            modifier = modifier,
+        ) {
+            Text(
+                text = "🖼 ${attachment.name}（无法显示）",
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** 文件附件：只显示名字和大小，点开是系统的事（这里不做预览）。 */
+@Composable
+private fun AttachmentFileChip(attachment: GroupAttachment, modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(10.dp),
+        modifier = modifier,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("📎", fontSize = 12.sp)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = attachment.name,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.widthIn(max = 180.dp),
+            )
+            val size = pro.openminis.app.ext.group.GroupAttachments.humanSize(attachment.size)
+            if (size.isNotBlank()) {
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = size,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -662,6 +814,10 @@ private fun Composer(
     onValueChange: (String) -> Unit,
     quote: GroupMessage?,
     onClearQuote: () -> Unit,
+    attachments: List<GroupAttachment>,
+    onRemoveAttachment: (GroupAttachment) -> Unit,
+    onPickImage: () -> Unit,
+    onPickFile: () -> Unit,
     busy: Boolean,
     bridgeReady: Boolean,
     onStop: () -> Unit,
@@ -691,7 +847,65 @@ private fun Composer(
                     TextButton(onClick = onClearQuote) { Text("取消") }
                 }
             }
+            // 待发送的附件：先在这里排一排，发出去之前还能删
+            if (attachments.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .horizontalScroll(rememberScrollState())
+                        .padding(bottom = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    attachments.forEach { a ->
+                        Box {
+                            if (a.isImage) {
+                                AttachmentImage(
+                                    attachment = a,
+                                    modifier = Modifier
+                                        .size(56.dp)
+                                        .clip(RoundedCornerShape(10.dp)),
+                                )
+                            } else {
+                                AttachmentFileChip(a)
+                            }
+                            IconButton(
+                                onClick = { onRemoveAttachment(a) },
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .align(Alignment.TopEnd)
+                                    .clip(CircleShape)
+                                    .background(Color(0xCC000000)),
+                            ) {
+                                Text("✕", color = Color.White, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
             Row(verticalAlignment = Alignment.Bottom) {
+                // 图片和文件分成两个入口：从相册选图是最常用的一条路，
+                // 混在一个「全部文件」里会多走好几步。
+                IconButton(
+                    onClick = onPickImage,
+                    enabled = !busy,
+                    modifier = Modifier.size(40.dp),
+                ) {
+                    Text(
+                        text = "🖼",
+                        fontSize = 18.sp,
+                        color = if (busy) Color(0xFFB0B0B5) else Color.Unspecified,
+                    )
+                }
+                IconButton(
+                    onClick = onPickFile,
+                    enabled = !busy,
+                    modifier = Modifier.size(40.dp),
+                ) {
+                    Text(
+                        text = "📎",
+                        fontSize = 18.sp,
+                        color = if (busy) Color(0xFFB0B0B5) else Color.Unspecified,
+                    )
+                }
                 OutlinedTextField(
                     value = value,
                     onValueChange = onValueChange,
@@ -700,7 +914,7 @@ private fun Composer(
                     maxLines = 5,
                     shape = RoundedCornerShape(20.dp),
                 )
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(6.dp))
                 if (busy) {
                     // 输出中：发送键换成停止键。打断后已输出的半截回复会保留在聊天里。
                     IconButton(
@@ -715,11 +929,13 @@ private fun Composer(
                 } else {
                     IconButton(
                         onClick = onSend,
-                        enabled = value.isNotBlank(),
+                        enabled = value.isNotBlank() || attachments.isNotEmpty(),
                         modifier = Modifier
                             .size(46.dp)
                             .clip(CircleShape)
-                            .background(if (value.isBlank()) Color(0xFFB0B0B5) else GC_BLUE),
+                            .background(
+                                if (value.isBlank() && attachments.isEmpty()) Color(0xFFB0B0B5) else GC_BLUE,
+                            ),
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送", tint = Color.White)
                     }
@@ -866,6 +1082,68 @@ private fun MemberToolsRow(member: GroupMemberDef, onSet: (Set<String>) -> Unit)
     }
 }
 
+/**
+ * 成员的技能白名单。
+ *
+ * 语义和「可调用工具」一致：不勾选就一个都不加载；「全开」等于跟随设置里
+ * 启用的全部技能。技能正文不会进提示词，只放清单，模型要用时自己读文件。
+ */
+@Composable
+private fun MemberSkillsRow(
+    member: GroupMemberDef,
+    available: List<GroupSkill>,
+    onSet: (Set<String>) -> Unit,
+) {
+    val picked = GroupSkills.select(available, member)
+    Column(modifier = Modifier.fillMaxWidth().padding(top = 2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("可调用技能", style = MaterialTheme.typography.labelSmall)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = GroupSkills.summary(available, member),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(
+                onClick = { onSet(available.map { it.id }.toSet()) },
+                enabled = available.isNotEmpty(),
+            ) { Text("全开", fontSize = 11.sp) }
+            TextButton(onClick = { onSet(emptySet()) }) { Text("关闭", fontSize = 11.sp) }
+        }
+        if (available.isEmpty()) {
+            Text(
+                text = "还没有已启用的技能：设置 › 技能，导入或启用后再回来",
+                style = MaterialTheme.typography.labelSmall,
+                color = GC_ORANGE,
+            )
+        } else {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                available.forEach { skill ->
+                    val on = picked.any { it.id == skill.id }
+                    FilterChip(
+                        selected = on,
+                        onClick = {
+                            val next = picked.map { it.id }.toMutableSet()
+                            if (on) next.remove(skill.id) else next.add(skill.id)
+                            onSet(next)
+                        },
+                        label = { Text(skill.name, fontSize = 11.sp) },
+                    )
+                }
+            }
+            Text(
+                text = "技能说明会写进成员共享的工作区，模型要用时自己读取；选了技能会自动允许读文件。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun GroupSettingsSheet(
@@ -874,6 +1152,7 @@ private fun GroupSettingsSheet(
     personas: PersonaRepository,
     freeModels: List<Pair<String, String>>,
     providerChoices: List<ProviderChoice>,
+    skills: List<GroupSkill>,
     onDismiss: () -> Unit,
     onChange: () -> Unit,
     onDeleteGroup: () -> Unit,
@@ -1022,6 +1301,16 @@ private fun GroupSettingsSheet(
                                     m.id,
                                     if (next.containsAll(GroupTools.ALL_IDS)) null else next.sorted(),
                                 )
+                                onChange()
+                            },
+                        )
+                        MemberSkillsRow(
+                            member = m,
+                            available = skills,
+                            onSet = { next ->
+                                // 同上：全选写回 null，将来装了新技能也会自动可用
+                                val all = skills.map { it.id }.toSet()
+                                store.setMemberSkills(m.id, if (next.containsAll(all)) null else next.sorted())
                                 onChange()
                             },
                         )
@@ -1313,3 +1602,69 @@ private fun modelLabel(member: GroupMemberDef, choices: List<ProviderChoice>): S
     }
     return "免费 · ${member.modelId}"
 }
+
+// ─── 图片与技能的小工具 ─────────────────────────────────────────────────────
+
+/**
+ * 把图片压成可以塞进请求体的 JPEG。
+ *
+ * 手机直出的照片动辄 4000×3000、几 MB，base64 之后还会再涨三分之一——很多
+ * 「OpenAI 兼容」端点直接 413。这里先按最长边 1600 降采样，再按质量递减压到
+ * 1.8 MB 以内；透明图铺白底，否则转 JPEG 会变成黑底。
+ */
+private fun encodeImageForRequest(file: File): ByteArray? = runCatching {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / sample > 1600 || bounds.outHeight / sample > 1600) sample *= 2
+    val bmp = BitmapFactory.decodeFile(
+        file.absolutePath,
+        BitmapFactory.Options().apply { inSampleSize = sample },
+    ) ?: return null
+
+    val flat = if (bmp.hasAlpha()) {
+        val out = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(out)
+        canvas.drawColor(android.graphics.Color.WHITE)
+        canvas.drawBitmap(bmp, 0f, 0f, null)
+        out
+    } else {
+        bmp
+    }
+    val bos = ByteArrayOutputStream()
+    var quality = 82
+    var bytes: ByteArray
+    do {
+        bos.reset()
+        flat.compress(Bitmap.CompressFormat.JPEG, quality, bos)
+        bytes = bos.toByteArray()
+        quality -= 12
+    } while (bytes.size > 1_800_000 && quality > 30)
+    if (flat !== bmp) flat.recycle()
+    bmp.recycle()
+    bytes
+}.getOrNull()
+
+/** 缩略图解码：按最长边降采样，绝不要把原图整张读进内存。 */
+private fun decodeThumbnail(path: String, maxSide: Int): Bitmap? = runCatching {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / sample > maxSide || bounds.outHeight / sample > maxSide) sample *= 2
+    BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+}.getOrNull()
+
+/**
+ * 上游 Skills 仓库里的「已启用技能」。
+ *
+ * MinisApp 在安全模式下可能还没初始化仓库（lateinit），这里一律 runCatching：
+ * 技能加载失败只该让群成员少一项能力，不该让整个群聊界面崩掉。
+ */
+private fun availableSkills(context: android.content.Context): List<GroupSkill> = runCatching {
+    val app = context.applicationContext as MinisApp
+    app.skillRepository.skills.value
+        .filter { it.isEnabled }
+        .map { GroupSkill(id = it.id, name = it.name, description = it.description, body = it.body) }
+}.getOrDefault(emptyList())

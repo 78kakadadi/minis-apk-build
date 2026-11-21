@@ -7,10 +7,13 @@ import pro.openminis.app.ext.usage.UsageCenter
 import pro.openminis.app.ext.usage.UsageEvent
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -20,6 +23,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.Base64
 import java.util.UUID
 
 /** 群聊引擎向外抛的增量事件。UI 按成员分段渲染。 */
@@ -96,14 +100,23 @@ class GroupChatEngine(
      * `filesDir/opencode/workspace`，这样两种成员看到的是同一批文件。
      */
     workspace: File? = null,
+    /** 已启用的技能。默认空：老调用方（测试、别的入口）不传就没有技能。 */
+    private val skills: GroupSkillSource = GroupSkillSource { emptyList() },
+    /**
+     * 把图片文件压成适合放进请求体的 JPEG 字节。
+     *
+     * 放在构造参数里而不是直接调 BitmapFactory，是为了让引擎能在 JVM 上跑单测
+     * （那边没有 Android 图形库）。返回 null 表示这张图没法编码，调用方会退化成
+     * 「已保存到工作区，用工具自己看」。
+     */
+    private val encodeImage: (File) -> ByteArray? = { null },
 ) {
 
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
     private val planner = GroupTurnPlanner()
-    private val tools = GroupToolRunner(
-        workspace = workspace ?: File(System.getProperty("java.io.tmpdir") ?: ".", "minis-group-workspace"),
-        http = http,
-    )
+    private val workDir = workspace
+        ?: File(System.getProperty("java.io.tmpdir") ?: ".", "minis-group-workspace")
+    private val tools = GroupToolRunner(workspace = workDir, http = http)
 
     /** 给消息栏用：当前群可发言成员的人设名，避免 UI 再查一次仓库。 */
     fun memberViews(groupId: String): List<Pair<GroupMemberDef, Persona?>> =
@@ -113,9 +126,10 @@ class GroupChatEngine(
         groupId: String,
         text: String,
         quote: GroupMessage? = null,
+        attachments: List<GroupAttachment> = emptyList(),
         onEvent: suspend (GroupEvent) -> Unit,
     ) = withContext(Dispatchers.IO) {
-        if (text.isBlank()) return@withContext
+        if (text.isBlank() && attachments.isEmpty()) return@withContext
 
         val group = store.group(groupId) ?: run {
             onEvent(GroupEvent.Notice("群不存在"))
@@ -141,6 +155,7 @@ class GroupChatEngine(
             createdAt = System.currentTimeMillis(),
             quoteMemberId = quote?.memberId,
             quotePreview = quote?.text?.take(120),
+            attachments = attachments,
         )
         store.appendMessage(userMessage)
         onEvent(GroupEvent.UserMessageAdded(userMessage.id))
@@ -169,7 +184,9 @@ class GroupChatEngine(
             members = planningMembers,
             strategy = group.strategy,
             quote = quoteRef,
-            topic = text,
+            // 纯图片消息没有正文：用一个能说明「有内容」的占位当话题，
+            // 否则任务自检和轮询策略会以为这一轮是空的。
+            topic = text.trim().ifBlank { "（用户发来了附件，请查看）" },
             traitsOf = { pid -> personas.get(pid)?.traits.orEmpty() },
             allowTakeover = group.allowTakeover,
         )
@@ -196,7 +213,7 @@ class GroupChatEngine(
             order.take(MAX_SPEAKERS).map { memberId ->
                 launch {
                     val member = members.firstOrNull { it.id == memberId } ?: return@launch
-                    speakOne(group, member, history, text, quote, onEvent)
+                    speakOne(group, member, history, text, quote, attachments, onEvent)
                 }
             }
         }
@@ -214,6 +231,7 @@ class GroupChatEngine(
         history: List<GroupMessage>,
         userText: String,
         quote: GroupMessage?,
+        attachments: List<GroupAttachment>,
         onEvent: suspend (GroupEvent) -> Unit,
     ) {
         val persona = personas.get(member.personaId)
@@ -221,20 +239,47 @@ class GroupChatEngine(
 
         val endpoint = resolver.resolve(member)
         if (endpoint == null) {
-            onEvent(
-                GroupEvent.MemberFailed(
-                    member.id,
-                    name,
-                    if (member.source == GroupMemberDef.SOURCE_PROVIDER)
-                        "绑定的 API 不可用（凭据缺失或该类型暂不支持），到群设置里改一下"
-                    else "免费通道未启用（设置 › 免费 Token 通道）",
+            val reason = if (member.source == GroupMemberDef.SOURCE_PROVIDER)
+                "绑定的 API 不可用（凭据缺失或该类型暂不支持），到群设置里改一下"
+            else "免费通道未启用（设置 › 免费 Token 通道）"
+            onEvent(GroupEvent.MemberFailed(member.id, name, reason))
+            // 也要落一条失败消息：否则界面上只有一行状态条，没有任何地方能点重试。
+            store.appendMessage(
+                GroupMessage(
+                    id = "msg_" + UUID.randomUUID().toString().take(8),
+                    groupId = group.id,
+                    role = "assistant",
+                    memberId = member.id,
+                    memberName = name,
+                    text = "（调用失败：$reason）",
+                    createdAt = System.currentTimeMillis(),
+                    failed = true,
                 ),
             )
             return
         }
 
+        // 技能：先过滤出这个成员能用的，再把正文镜像进工作区（两种来源都靠 read_file 读）
+        val available = runCatching { skills.skillsFor(member) }.getOrDefault(emptyList())
+        val picked = GroupSkills.select(available, member)
+        val mirrored = GroupSkills.mirrorToWorkspace(workDir, picked)
+        val promptSkills = picked.filter { it.id in mirrored }
+        val skillFragment = GroupSkills.promptFragment(promptSkills)
+
+        // 选了技能却不让读文件，技能等于摆设：自动补上「读文件」，
+        // 但用户显式关掉全部工具（空集合）时不补——那是一个明确的安全选择。
+        var allowedTools = GroupTools.allowed(member)
+        if (promptSkills.isNotEmpty() && allowedTools.isNotEmpty()) {
+            allowedTools = allowedTools + GroupTools.READ
+        }
+        val freeToolRule: Set<String>? =
+            if (member.tools == null && promptSkills.isEmpty()) null else allowedTools
+
         // 任务适配自检：只问一句「适合你吗」，不适合就不占用一轮发言
-        if (group.autoTaskFit && shouldSkip(endpoint, persona, name, userText)) {
+        val taskForFit = userText.trim().ifBlank {
+            attachments.joinToString("、") { it.name }.let { "用户发来了附件：$it" }
+        }
+        if (group.autoTaskFit && shouldSkip(endpoint, persona, name, taskForFit)) {
             onEvent(GroupEvent.MemberSkipped(member.id, name, "判断这个任务不适合自己"))
             store.appendMessage(
                 GroupMessage(
@@ -288,6 +333,9 @@ class GroupChatEngine(
                 history = history,
                 userText = userText,
                 quote = quote,
+                attachments = attachments,
+                skillFragment = skillFragment,
+                freeToolRule = freeToolRule,
                 onDelta = { chunk ->
                     reply.append(chunk)
                     onEvent(GroupEvent.MemberDelta(member.id, chunk))
@@ -319,7 +367,7 @@ class GroupChatEngine(
                         persistDraft(streaming = true)
                     }
                 },
-                allowedTools = GroupTools.allowed(member),
+                allowedTools = allowedTools,
             )
         } catch (e: CancellationException) {
             // 打断：半截回复落盘（没字就把草稿删掉，别留空壳），再把取消抛回去
@@ -345,6 +393,8 @@ class GroupChatEngine(
             }
             throw e
         } catch (e: Exception) {
+            // 同上：取消引起的断连不算失败
+            currentCoroutineContext().ensureActive()
             failure = e
         }
 
@@ -429,7 +479,10 @@ class GroupChatEngine(
             return@withContext
         }
         val userMessage = all[lastUserIdx]
-        val history = all.subList(0, lastUserIdx + 1)
+        // 不含这条用户消息本身：speakOne 会把「本轮用户输入」再拼一次。
+        // 以前这里写的是 lastUserIdx + 1，结果请求里出现两条一模一样的 user
+        // 消息，部分端点直接 400——真机上就是「点重试永远失败」。
+        val history = all.subList(0, lastUserIdx)
 
         // 引用只有 preview（120 字），重试用它还原最接近的引用形态
         val quote = userMessage.quoteMemberId?.let { qid ->
@@ -439,7 +492,7 @@ class GroupChatEngine(
         withContext(NonCancellable) {
             store.removeLastFailedMessage(groupId, memberId)
         }
-        speakOne(group, member, history, userMessage.text, quote, onEvent)
+        speakOne(group, member, history, userMessage.text, quote, userMessage.attachments, onEvent)
     }
 
     private fun nameOf(members: List<GroupMemberDef>, id: String): String =
@@ -455,7 +508,19 @@ class GroupChatEngine(
         val arr = JSONArray()
         history.forEach { m ->
             if (m.isUser) {
-                arr.put(JSONObject().put("role", "user").put("content", m.text))
+                // 历史里的图片一律转成文字说明（已存到工作区）：每轮都把之前的
+                // 图重传一遍既贵又慢，而且模型真的需要时可以用 read_file 打开。
+                val content = if (m.attachments.isEmpty()) {
+                    m.text
+                } else {
+                    GroupAttachments.messageText(
+                        text = m.text,
+                        attachments = m.attachments,
+                        workspace = workDir,
+                        imageAsText = true,
+                    )
+                }
+                arr.put(JSONObject().put("role", "user").put("content", content))
             } else if (m.skipped) {
                 // 跳过也算一条公开事实，但不值得占篇幅
             } else if (m.memberName != null) {
@@ -467,7 +532,12 @@ class GroupChatEngine(
         return arr
     }
 
-    private fun systemPrompt(persona: Persona?, memberName: String, member: GroupMemberDef): String {
+    private fun systemPrompt(
+        persona: Persona?,
+        memberName: String,
+        member: GroupMemberDef,
+        skillFragment: String,
+    ): String {
         val effort = when (member.reasoning) {
             "low" -> "回答尽量简短直接，不要展开推理。"
             "high" -> "回答前充分推演，给出完整论证；但只输出最终答复，不要输出思考过程。"
@@ -482,6 +552,7 @@ class GroupChatEngine(
             append("其他成员的发言会以【名字】标注，需要时可以回应，但不要替他们说话。")
             append("不要复述别人刚说过的话，直接给出你的观点或结果。")
             if (effort.isNotBlank()) append("\n").append(effort)
+            if (skillFragment.isNotBlank()) append(skillFragment)
         }
     }
 
@@ -508,22 +579,40 @@ class GroupChatEngine(
             .put("messages", JSONArray()
                 .put(JSONObject().put("role", "system").put("content", system))
                 .put(JSONObject().put("role", "user").put("content", "任务：${task.take(800)}")))
-        val answer = runCatching { callOnce(endpoint, body) }.getOrNull() ?: return false
+        val answer = try {
+            callOnce(endpoint, body)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 自检失败（含被停止断连）不该让这一轮变失败，但取消必须继续往上抛
+            currentCoroutineContext().ensureActive()
+            return false
+        }
         return answer.contains("UNSUITABLE", ignoreCase = true)
     }
 
-    private fun callOnce(endpoint: MemberEndpoint, body: JSONObject): String {
+    @OptIn(InternalCoroutinesApi::class)
+    private suspend fun callOnce(endpoint: MemberEndpoint, body: JSONObject): String {
         val req = Request.Builder()
             .url("${endpoint.baseUrl}/chat/completions")
             .post(body.toString().toRequestBody(jsonMedia))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer ${endpoint.apiKey}")
             .build()
-        http.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code} ${text.take(200)}")
-            val choices = JSONObject(text).optJSONArray("choices") ?: return ""
-            return choices.optJSONObject(0)?.optJSONObject("message")?.optString("content").orEmpty()
+        val call = http.newCall(req)
+        // 自检也是一次真实请求（虽然 stream=false）：点停止时同样要能被掐断，
+        // 否则用户会看到「点了停止，还要再等几秒才停」。
+        val onDone = currentCoroutineContext()[Job]
+            ?.invokeOnCompletion(onCancelling = true) { call.cancel() }
+        try {
+            call.execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code} ${text.take(200)}")
+                val choices = JSONObject(text).optJSONArray("choices") ?: return ""
+                return choices.optJSONObject(0)?.optJSONObject("message")?.optString("content").orEmpty()
+            }
+        } finally {
+            onDone?.dispose()
         }
     }
 
@@ -547,6 +636,9 @@ class GroupChatEngine(
         history: List<GroupMessage>,
         userText: String,
         quote: GroupMessage?,
+        attachments: List<GroupAttachment>,
+        skillFragment: String,
+        freeToolRule: Set<String>?,
         onDelta: suspend (String) -> Unit,
         onThinking: suspend (String) -> Unit,
         onTool: suspend (String) -> Unit,
@@ -561,22 +653,29 @@ class GroupChatEngine(
             }
             append(userText)
         }
-        messages.put(JSONObject().put("role", "user").put("content", current))
+        messages.put(
+            JSONObject()
+                .put("role", "user")
+                .put("content", currentContent(current, attachments, endpoint.isFree)),
+        )
 
         val full = JSONArray()
-        full.put(JSONObject().put("role", "system").put("content", systemPrompt(persona, memberName, member)))
+        full.put(
+            JSONObject()
+                .put("role", "system")
+                .put("content", systemPrompt(persona, memberName, member, skillFragment)),
+        )
         for (i in 0 until messages.length()) {
             messages.optJSONObject(i)?.let { full.put(it) }
         }
 
         if (endpoint.isFree) {
-            // null = 用户没限制过，等价于 OpenCode 的默认全开；显式集合才下推权限。
-            val rule = endpoint.tools
+            // null = 用户没限制过且没用技能，等价于 OpenCode 的默认全开；显式集合才下推权限。
             return streamOnce(
                 endpoint = endpoint,
                 messages = full,
                 tools = null,
-                freeToolRule = rule,
+                freeToolRule = freeToolRule,
                 onDelta = onDelta,
                 onThinking = onThinking,
             ).usage
@@ -590,6 +689,55 @@ class GroupChatEngine(
             onThinking = onThinking,
             onTool = onTool,
         )
+    }
+
+    /**
+     * 本轮用户输入的内容块。
+     *
+     * 文本 + 文本类附件始终拼成一段字符串；图片在看得到图的成员那边走
+     * OpenAI 多模态（content 数组），在免费通道那边退化成「已存到工作区，
+     * 用 read_file 看」——桥接只接受文本，硬塞 image_url 会被上游直接丢掉。
+     */
+    private fun currentContent(
+        text: String,
+        attachments: List<GroupAttachment>,
+        free: Boolean,
+    ): Any {
+        val merged = GroupAttachments.messageText(
+            text = text,
+            attachments = attachments,
+            workspace = workDir,
+            imageAsText = free,
+        )
+        if (free || attachments.none { it.isImage }) return merged
+
+        val images = attachments.filter { it.isImage }.take(GroupAttachments.MAX_IMAGES)
+        val parts = JSONArray()
+        parts.put(JSONObject().put("type", "text").put("text", merged))
+        var encoded = 0
+        images.forEach { a ->
+            val bytes = runCatching { encodeImage(File(a.path)) }.getOrNull() ?: return@forEach
+            if (bytes.isEmpty() || bytes.size > MAX_IMAGE_BYTES) return@forEach
+            val mime = a.mime.takeIf { it.startsWith("image/") } ?: "image/jpeg"
+            parts.put(
+                JSONObject()
+                    .put("type", "image_url")
+                    .put(
+                        "image_url",
+                        JSONObject().put(
+                            "url",
+                            "data:$mime;base64," + Base64.getEncoder().encodeToString(bytes),
+                        ),
+                    ),
+            )
+            encoded++
+        }
+        if (encoded == 0) {
+            // 一张都没编码成功（格式不支持 / 太大）：退回文字版，
+            // 模型至少知道「有图、图在哪」，不会以为消息是空的。
+            return GroupAttachments.messageText(text, attachments, workDir, imageAsText = true)
+        }
+        return parts
     }
 
     /**
@@ -629,6 +777,10 @@ class GroupChatEngine(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // 被「停止」断开的连接会抛 IOException，它不是取消异常。
+                // 先看一眼协程是不是已经取消：是就把取消抛回去，让上层走
+                // 「打断」分支（保留半截内容），而不是记成一次调用失败。
+                currentCoroutineContext().ensureActive()
                 // 兼容性兜底：不少「OpenAI 兼容」模型其实不支持 function calling，
                 // 带 tools 直接 400。旧群成员升级后默认全开工具，如果不降级，
                 // 原本能聊的群会突然整条失败——这比「工具没生效」严重得多。
@@ -711,6 +863,7 @@ class GroupChatEngine(
     }
 
     /** 一次流式请求（不含工具循环）。tool_calls 按 index 累积成完整调用。 */
+    @OptIn(InternalCoroutinesApi::class)
     private suspend fun streamOnce(
         endpoint: MemberEndpoint,
         messages: JSONArray,
@@ -741,12 +894,17 @@ class GroupChatEngine(
             .build()
 
         // 用户点「停止」时协程被取消，但 readUtf8Line 是阻塞的 socket 读——
-        // 不主动断连的话读线程会一直挂到 readTimeout。协程一完成（含取消）
-        // 就 cancel 连接，阻塞读立刻抛 IOException 退出。
+        // 不主动断连的话读线程会一直挂到 readTimeout。
+        //
+        // 这里必须用 `onCancelling = true`：默认的 invokeOnCompletion 只在协程
+        // **完全结束**后回调，而协程正卡在这次阻塞读上，两者互等到天荒地老——
+        // 真机表现就是「点了暂停没反应，AI 一直在吐字，转圈也不停」。
+        // 加上 onCancelling 后，cancel 的瞬间就会断开连接，读操作立刻抛
+        // IOException，下面的 catch 再把它还原成 CancellationException。
         val result = RoundResult()
         val call = http.newCall(req)
         val job = currentCoroutineContext()[Job]
-        val onDone = job?.invokeOnCompletion { call.cancel() }
+        val onDone = job?.invokeOnCompletion(onCancelling = true) { call.cancel() }
         try {
             call.execute().use { resp ->
                 if (!resp.isSuccessful) {
@@ -755,6 +913,9 @@ class GroupChatEngine(
                 }
                 val source = resp.body?.source() ?: throw IllegalStateException("响应为空")
                 while (true) {
+                    // 断连后 readUtf8Line 返回 null 会走到 break，看起来像「正常结束」
+                    // ——那样半截回复会被当成完整回答。取消优先，直接抛出去。
+                    if (!currentCoroutineContext().isActive) throw CancellationException("已停止")
                     val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val payload = line.removePrefix("data:").trim()
@@ -828,5 +989,11 @@ class GroupChatEngine(
 
         /** 一条回复里最多允许模型来回调用几轮工具，防止死循环烧 token。 */
         const val MAX_TOOL_ROUNDS = 6
+
+        /**
+         * 单张图片编码后的上限。base64 会膨胀约 4/3，2 MB 原图大约 2.7 MB 请求体，
+         * 再大很多「OpenAI 兼容」端点会直接 413。
+         */
+        const val MAX_IMAGE_BYTES = 2 * 1024 * 1024
     }
 }
