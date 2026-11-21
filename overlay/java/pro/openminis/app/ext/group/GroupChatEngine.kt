@@ -34,6 +34,12 @@ sealed interface GroupEvent {
     /** 成员自检后认为任务不适合自己，本轮不发言。 */
     data class MemberSkipped(val memberId: String, val name: String, val reason: String) : GroupEvent
     data class Notice(val text: String) : GroupEvent
+
+    /**
+     * 用户消息已落盘。界面收到后立刻刷新，让人一发送就看到自己那条——
+     * 以前要等整轮结束才 version++，中途看起来就像「消息没发出去」。
+     */
+    data class UserMessageAdded(val messageId: String) : GroupEvent
 }
 
 /**
@@ -104,7 +110,8 @@ class GroupChatEngine(
         }
 
         // 关键：先取快照，再写入本轮用户消息。见类注释的「上下文可见性」。
-        val history = store.messages(groupId).takeLast(HISTORY_LIMIT)
+        // 流式草稿（还在写的那条）要排掉：它是半截内容，不是这轮的完整答复。
+        val history = store.messages(groupId).filter { !it.streaming }.takeLast(HISTORY_LIMIT)
 
         val userMessage = GroupMessage(
             id = "msg_" + UUID.randomUUID().toString().take(8),
@@ -118,6 +125,7 @@ class GroupChatEngine(
             quotePreview = quote?.text?.take(120),
         )
         store.appendMessage(userMessage)
+        onEvent(GroupEvent.UserMessageAdded(userMessage.id))
 
         val planningMembers = members.map { m ->
             GroupMember(
@@ -226,10 +234,33 @@ class GroupChatEngine(
         }
 
         onEvent(GroupEvent.MemberStarted(member.id, name))
+        // 这条回复的固定 id：草稿、最终版、打断版都覆盖同一条记录，界面上永远
+        // 只有一条气泡。以前是「说完才 append」，中途退出界面就什么都留不下。
+        val messageId = "msg_" + UUID.randomUUID().toString().take(8)
+        val createdAt = System.currentTimeMillis()
         val reply = StringBuilder()
         val thinking = StringBuilder()
+        var lastPersistAt = 0L
         var usage: TokenUsage? = null
         var failure: Throwable? = null
+
+        /** 把「到目前为止」的内容写盘。streaming=true 表示还会被后续覆盖。 */
+        fun persistDraft(streaming: Boolean) {
+            store.upsertMessage(
+                GroupMessage(
+                    id = messageId,
+                    groupId = group.id,
+                    role = "assistant",
+                    memberId = member.id,
+                    memberName = name,
+                    text = reply.toString(),
+                    createdAt = createdAt,
+                    thinking = thinking.toString().trim().ifBlank { null },
+                    streaming = streaming,
+                ),
+            )
+        }
+
         try {
             usage = streamMember(
                 endpoint = endpoint,
@@ -242,27 +273,42 @@ class GroupChatEngine(
                 onDelta = { chunk ->
                     reply.append(chunk)
                     onEvent(GroupEvent.MemberDelta(member.id, chunk))
+                    // 节流落盘：每个字都写文件会把主线程外的 IO 打满，
+                    // 0.7 秒一次足够让「切走再回来」看到最新进度。
+                    val now = System.currentTimeMillis()
+                    if (now - lastPersistAt >= STREAM_PERSIST_MS) {
+                        lastPersistAt = now
+                        persistDraft(streaming = true)
+                    }
                 },
                 onThinking = { chunk ->
                     thinking.append(chunk)
                     onEvent(GroupEvent.MemberThinking(member.id, chunk))
+                    val now = System.currentTimeMillis()
+                    if (now - lastPersistAt >= STREAM_PERSIST_MS) {
+                        lastPersistAt = now
+                        persistDraft(streaming = true)
+                    }
                 },
             )
         } catch (e: CancellationException) {
-            // 打断：半截回复落盘（没字就不留空壳），再把取消抛回去让 UI 收尾
-            val partial = reply.toString().trim()
-            if (partial.isNotEmpty()) {
-                withContext(NonCancellable) {
-                    store.appendMessage(
+            // 打断：半截回复落盘（没字就把草稿删掉，别留空壳），再把取消抛回去
+            withContext(NonCancellable) {
+                if (reply.toString().isBlank()) {
+                    store.removeMessage(group.id, messageId)
+                } else {
+                    store.upsertMessage(
                         GroupMessage(
-                            id = "msg_" + UUID.randomUUID().toString().take(8),
+                            id = messageId,
                             groupId = group.id,
                             role = "assistant",
                             memberId = member.id,
                             memberName = name,
-                            text = partial,
-                            createdAt = System.currentTimeMillis(),
+                            text = reply.toString().trim(),
+                            createdAt = createdAt,
+                            thinking = thinking.toString().trim().ifBlank { null },
                             interrupted = true,
+                            streaming = false,
                         ),
                     )
                 }
@@ -274,33 +320,37 @@ class GroupChatEngine(
 
         if (failure != null) {
             onEvent(GroupEvent.MemberFailed(member.id, name, failure.message ?: "调用失败"))
-            store.appendMessage(
+            store.upsertMessage(
                 GroupMessage(
-                    id = "msg_" + UUID.randomUUID().toString().take(8),
+                    id = messageId,
                     groupId = group.id,
                     role = "assistant",
                     memberId = member.id,
                     memberName = name,
                     text = "（调用失败：${failure.message}）",
-                    createdAt = System.currentTimeMillis(),
+                    createdAt = createdAt,
                     failed = true,
+                    streaming = false,
                 ),
             )
         } else {
             val finalText = reply.toString().trim()
-            onEvent(GroupEvent.MemberFinished(member.id, name, finalText))
-            store.appendMessage(
+            // 先落盘再发事件：UI 收到 MemberFinished 会撤掉流式气泡，
+            // 这样磁盘上已经有最终版，不会出现「气泡没了、消息也没了」。
+            store.upsertMessage(
                 GroupMessage(
-                    id = "msg_" + UUID.randomUUID().toString().take(8),
+                    id = messageId,
                     groupId = group.id,
                     role = "assistant",
                     memberId = member.id,
                     memberName = name,
                     text = finalText.ifBlank { "（本轮没有输出）" },
-                    createdAt = System.currentTimeMillis(),
+                    createdAt = createdAt,
                     thinking = thinking.toString().trim().ifBlank { null },
+                    streaming = false,
                 ),
             )
+            onEvent(GroupEvent.MemberFinished(member.id, name, finalText))
             // 绑定已存 API 的成员直连外部服务，bridge 看不到这些调用——
             // 用量在这里记账。免费成员走 bridge，由 bridge 侧记录，避免双重入账。
             if (usage != null && !usage.isEmpty && member.source == GroupMemberDef.SOURCE_PROVIDER) {
@@ -341,7 +391,7 @@ class GroupChatEngine(
             return@withContext
         }
 
-        val all = store.messages(groupId)
+        val all = store.messages(groupId).filter { !it.streaming }
         // 最后一条用户消息定义了「当前轮」；重试只覆盖本轮，不吃进本轮已落盘的回复
         val lastUserIdx = all.indexOfLast { it.isUser }
         if (lastUserIdx < 0) {
@@ -544,5 +594,8 @@ class GroupChatEngine(
 
         /** 带进上下文的历史条数。群聊越长，越需要压住 token。 */
         const val HISTORY_LIMIT = 24
+
+        /** 流式草稿落盘节流：每个字都写文件会把 IO 打满。 */
+        const val STREAM_PERSIST_MS = 700L
     }
 }

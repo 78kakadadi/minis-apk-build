@@ -57,7 +57,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import pro.openminis.app.ext.group.AiAvatars
 import pro.openminis.app.ext.group.AvatarSpec
 import pro.openminis.app.ext.group.GroupChatEngine
+import pro.openminis.app.ext.group.GroupChatJobs
 import pro.openminis.app.ext.group.GroupDef
 import pro.openminis.app.ext.group.GroupEvent
 import pro.openminis.app.ext.group.GroupMemberDef
@@ -84,6 +84,7 @@ import pro.openminis.app.ext.opencode.runtime.ProviderChoice
 import pro.openminis.app.ext.persona.PersonaFileStore
 import pro.openminis.app.ext.persona.PersonaRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -112,14 +113,17 @@ fun GroupChatScreen(
     initialGroupId: String? = null,
 ) {
     val context = LocalContext.current
-    val store = remember(context) { GroupStore(context) }
-    val personas = remember(context) { PersonaRepository(PersonaFileStore(context)) }
-    val manager = remember(context) { FreeTokenManager.get(context) }
+    // 群聊任务现在跑在进程级 scope（GroupChatJobs）里，可能比这个界面活得久，
+    // 所以这里一律用 applicationContext，避免把 Activity 泄漏出去。
+    val appContext = remember(context) { context.applicationContext }
+    val store = remember(appContext) { GroupStore(appContext) }
+    val personas = remember(appContext) { PersonaRepository(PersonaFileStore(appContext)) }
+    val manager = remember(appContext) { FreeTokenManager.get(appContext) }
     val freeModels by manager.models.collectAsState()
 
-    val resolver = remember(context) {
+    val resolver = remember(appContext) {
         GroupEndpointResolver(
-            context = context,
+            context = appContext,
             freeBaseUrl = { manager.bridgeBaseUrl },
             freeModels = { manager.models.value },
         )
@@ -153,8 +157,10 @@ fun GroupChatScreen(
     var quote by remember { mutableStateOf<GroupMessage?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var newGroupName by remember { mutableStateOf("") }
-    // 当前一轮发言的任务句柄：保存它才能支持「输出中打断」
-    var currentJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    // 磁盘上的流式草稿：界面里已经有活跃流式气泡（pending 里有这个成员）时
+    // 隐藏草稿，否则同一条回复会出现两次；从别处切回来时 pending 是空的，
+    // 草稿就顶上来显示「已经输出的部分」。
+    val visibleMessages = messages.filter { !it.streaming || pending[it.memberId] == null }
     // send 与重试共用同一套事件处理：成员消息进流式气泡，失败写状态条
     val handleEvent: suspend (GroupEvent) -> Unit = { ev ->
         kotlinx.coroutines.withContext(Dispatchers.Main) {
@@ -169,27 +175,52 @@ fun GroupChatScreen(
                     thinking = thinking + (
                         ev.memberId to ((thinking[ev.memberId] ?: "") + ev.text)
                         )
-                is GroupEvent.MemberFinished ->
+                is GroupEvent.MemberFinished -> {
+                    // 先落盘再发事件，所以这里直接刷新就能看到这条最终答复，
+                    // 不用等整轮（多个成员）全说完。
                     pending = pending - ev.memberId
+                    version++
+                }
                 is GroupEvent.MemberSkipped -> {
                     pending = pending - ev.memberId
                     status = "${ev.name} 跳过了这轮：${ev.reason}"
+                    version++
                 }
                 is GroupEvent.MemberFailed -> {
                     pending = pending - ev.memberId
                     status = "${ev.name} 调用失败：${ev.reason}"
+                    version++
                 }
+                is GroupEvent.UserMessageAdded ->
+                    // 用户消息已落盘：立刻刷新，人一发送就能看到自己那条
+                    version++
                 is GroupEvent.Notice -> status = ev.text
             }
         }
     }
 
-    val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
+    // 进群/切回时如果这一轮还在跑（任务在进程级 scope 里，不跟界面一起死），
+    // 跟着磁盘上的进度刷新，直到跑完。这就是「退出界面再回来还能看到回复」。
+    LaunchedEffect(currentId) {
+        val gid = currentId ?: return@LaunchedEffect
+        if (GroupChatJobs.isRunning(gid)) {
+            busy = true
+            while (GroupChatJobs.isRunning(gid)) {
+                version++
+                kotlinx.coroutines.delay(700)
+            }
+            busy = false
+            pending = emptyMap()
+            thinking = emptyMap()
+            version++
+        }
+    }
+
     // 自动跟随只在用户本来就在底部时生效：输出过程中往上翻看历史，不会被强行拽回底部
-    LaunchedEffect(messages.size, pending.size, pending.values.sumOf { it.length }) {
-        val total = messages.size + pending.size
+    LaunchedEffect(visibleMessages.size, pending.size, pending.values.sumOf { it.length }) {
+        val total = visibleMessages.size + pending.size
         if (total > 0 && !listState.canScrollForward) {
             runCatching { listState.animateScrollToItem(total - 1) }
         }
@@ -264,7 +295,7 @@ fun GroupChatScreen(
                     start = 14.dp, end = 14.dp, top = 10.dp, bottom = 10.dp,
                 ),
             ) {
-                items(messages, key = { it.id }) { m ->
+                items(visibleMessages, key = { it.id }) { m ->
                     if (m.isUser) {
                         UserBubble(m)
                     } else {
@@ -276,11 +307,11 @@ fun GroupChatScreen(
                                 {
                                     status = ""
                                     busy = true
-                                    currentJob = scope.launch {
+                                    GroupChatJobs.launch(retryGroupId) {
                                         try {
                                             engine.retryMember(retryGroupId, m.memberId!!, handleEvent)
                                         } finally {
-                                            withContext(Dispatchers.Main) {
+                                            withContext(NonCancellable + Dispatchers.Main) {
                                                 busy = false
                                                 pending = emptyMap()
                                                 thinking = emptyMap()
@@ -326,7 +357,7 @@ fun GroupChatScreen(
                 bridgeReady = manager.bridgeBaseUrl != null || members.any {
                     it.source == GroupMemberDef.SOURCE_PROVIDER
                 },
-                onStop = { currentJob?.cancel() },
+                onStop = { GroupChatJobs.cancel(sendGroupId) },
                 onSend = {
                     val text = input.trim()
                     if (text.isNotEmpty() && !busy) {
@@ -337,12 +368,13 @@ fun GroupChatScreen(
                         thinking = emptyMap()
                         val q = quote
                         quote = null
-                        val gid = sendGroupId
-                        currentJob = scope.launch {
+                        GroupChatJobs.launch(sendGroupId) {
                             try {
-                                engine.send(gid, text, q, handleEvent)
+                                engine.send(sendGroupId, text, q, handleEvent)
                             } finally {
-                                withContext(Dispatchers.Main) {
+                                // 被「停止」取消时 withContext 本身会立刻抛，必须 NonCancellable，
+                                // 否则 busy 一直为 true，发送键永远停在停止态。
+                                withContext(NonCancellable + Dispatchers.Main) {
                                     busy = false
                                     pending = emptyMap()
                                     thinking = emptyMap()

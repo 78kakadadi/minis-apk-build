@@ -65,6 +65,12 @@ data class GroupMessage(
     val skipped: Boolean = false,
     /** 用户主动打断时留下的半截回复。 */
     val interrupted: Boolean = false,
+    /**
+     * 正在流式输出中的草稿。每 0.7 秒覆盖一次同 id 的记录，用来支持
+     * 「输出到一半退出界面，再进来还能看到已输出的部分」。
+     * 界面上有活跃的流式气泡时这些草稿会被隐藏，避免同一条回复出现两次。
+     */
+    val streaming: Boolean = false,
 ) {
     val isUser: Boolean get() = role == "user"
 }
@@ -85,6 +91,20 @@ class GroupStore(context: Context) {
         if (!dir.exists()) dir.mkdirs()
     }
 
+    /**
+     * 全进程一把锁，而不是用 `this`。
+     *
+     * `GroupStore(context)` 每次进群聊界面都会 new 一个实例，实例锁挡不住另一个
+     * 实例；而群聊是**多个成员同时流式输出**，每次写消息都是「读整份 JSON →
+     * 改 → 写回」。没有这把锁时后写的人会把先写的人整段覆盖掉——真机上的表现
+     * 就是「发完消息我的消息没了」「某个 AI 的回复突然消失」。
+     */
+    private inline fun <T> lock(block: () -> T): T = synchronized(LOCK, block)
+
+    private companion object {
+        val LOCK = Any()
+    }
+
     // ---- 群 ---------------------------------------------------------------
 
     fun groups(): List<GroupDef> = readIndex().optJSONArray("groups").toList { o ->
@@ -101,7 +121,7 @@ class GroupStore(context: Context) {
 
     fun group(groupId: String): GroupDef? = groups().firstOrNull { it.id == groupId }
 
-    fun createGroup(name: String): GroupDef {
+    fun createGroup(name: String): GroupDef = lock {
         val group = GroupDef(
             id = "g_" + UUID.randomUUID().toString().take(8),
             name = name.trim().ifBlank { "新群聊" },
@@ -120,14 +140,14 @@ class GroupStore(context: Context) {
         )
         root.put("groups", arr)
         writeIndex(root)
-        return group
+        group
     }
 
     fun renameGroup(groupId: String, name: String) {
         updateGroup(groupId) { it.put("name", name.trim().ifBlank { "新群聊" }) }
     }
 
-    fun deleteGroup(groupId: String) {
+    fun deleteGroup(groupId: String) = lock {
         val root = readIndex()
         val arr = root.optJSONArray("groups") ?: JSONArray()
         val kept = JSONArray()
@@ -146,6 +166,7 @@ class GroupStore(context: Context) {
         root.put("members", keptMembers)
         writeIndex(root)
         runCatching { messagesFile(groupId).delete() }
+        Unit
     }
 
     fun setStrategy(groupId: String, strategy: TurnStrategy) {
@@ -161,13 +182,15 @@ class GroupStore(context: Context) {
     }
 
     private fun updateGroup(groupId: String, block: (JSONObject) -> Unit) {
-        val root = readIndex()
-        val arr = root.optJSONArray("groups") ?: return
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (o.str("id") == groupId) block(o)
+        lock {
+            val root = readIndex()
+            val arr = root.optJSONArray("groups") ?: return@lock
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.str("id") == groupId) block(o)
+            }
+            writeIndex(root)
         }
-        writeIndex(root)
     }
 
     // ---- 成员 -------------------------------------------------------------
@@ -197,7 +220,7 @@ class GroupStore(context: Context) {
         source: String = GroupMemberDef.SOURCE_FREE,
         providerInstanceId: String = "",
         reasoning: String = "medium",
-    ): GroupMemberDef {
+    ): GroupMemberDef = lock {
         val member = GroupMemberDef(
             id = "m_" + UUID.randomUUID().toString().take(8),
             groupId = groupId,
@@ -213,7 +236,7 @@ class GroupStore(context: Context) {
         arr.put(JSONObject().apply { writeMember(this, member) })
         root.put("members", arr)
         writeIndex(root)
-        return member
+        member
     }
 
     private fun writeMember(o: JSONObject, member: GroupMemberDef) {
@@ -231,13 +254,15 @@ class GroupStore(context: Context) {
     }
 
     fun updateMember(memberId: String, block: (JSONObject) -> Unit) {
-        val root = readIndex()
-        val arr = root.optJSONArray("members") ?: return
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (o.str("id") == memberId) block(o)
+        lock {
+            val root = readIndex()
+            val arr = root.optJSONArray("members") ?: return@lock
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.str("id") == memberId) block(o)
+            }
+            writeIndex(root)
         }
-        writeIndex(root)
     }
 
     fun setMemberEnabled(memberId: String, enabled: Boolean) =
@@ -264,15 +289,17 @@ class GroupStore(context: Context) {
     }
 
     fun removeMember(memberId: String) {
-        val root = readIndex()
-        val arr = root.optJSONArray("members") ?: return
-        val kept = JSONArray()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            if (o.str("id") != memberId) kept.put(o)
+        lock {
+            val root = readIndex()
+            val arr = root.optJSONArray("members") ?: return@lock
+            val kept = JSONArray()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.str("id") != memberId) kept.put(o)
+            }
+            root.put("members", kept)
+            writeIndex(root)
         }
-        root.put("members", kept)
-        writeIndex(root)
     }
 
     /** 引用计数：人设删除前提示"有 N 个成员在用"。 */
@@ -281,11 +308,11 @@ class GroupStore(context: Context) {
 
     // ---- 消息 -------------------------------------------------------------
 
-    fun messages(groupId: String): List<GroupMessage> {
+    fun messages(groupId: String): List<GroupMessage> = lock {
         val f = messagesFile(groupId)
-        if (!f.exists()) return emptyList()
-        val root = runCatching { JSONObject(f.readText()) }.getOrNull() ?: return emptyList()
-        return root.optJSONArray("messages").toList { o ->
+        if (!f.exists()) return@lock emptyList()
+        val root = runCatching { JSONObject(f.readText()) }.getOrNull() ?: return@lock emptyList()
+        root.optJSONArray("messages").toList { o ->
             GroupMessage(
                 id = o.str("id"),
                 groupId = groupId,
@@ -300,6 +327,7 @@ class GroupStore(context: Context) {
                 thinking = o.optString("thinking").ifBlank { null },
                 skipped = o.optBoolean("skipped", false),
                 interrupted = o.optBoolean("interrupted", false),
+                streaming = o.optBoolean("streaming", false),
             )
         }
     }
@@ -307,42 +335,40 @@ class GroupStore(context: Context) {
     /** 主页列表用：最后一条消息的预览文本。 */
     fun lastMessage(groupId: String): GroupMessage? = messages(groupId).lastOrNull()
 
-    fun appendMessage(message: GroupMessage) {
-        val f = messagesFile(message.groupId)
-        val root = if (f.exists()) {
-            runCatching { JSONObject(f.readText()) }.getOrNull() ?: JSONObject()
-        } else JSONObject()
-        val arr = root.optJSONArray("messages") ?: JSONArray()
-        arr.put(
-            JSONObject()
-                .put("id", message.id)
-                .put("role", message.role)
-                .put("memberId", message.memberId ?: "")
-                .put("memberName", message.memberName ?: "")
-                .put("text", message.text)
-                .put("createdAt", message.createdAt)
-                .put("quoteMemberId", message.quoteMemberId ?: "")
-                .put("quotePreview", message.quotePreview ?: "")
-                .put("failed", message.failed)
-                .put("thinking", message.thinking ?: "")
-                .put("skipped", message.skipped)
-                .put("interrupted", message.interrupted),
-        )
-        root.put("messages", arr)
-        f.parentFile?.mkdirs()
-        f.writeText(root.toString())
+    fun appendMessage(message: GroupMessage) = lock {
+        mutateMessages(message.groupId) { it.put(messageJson(message)) }
+    }
+
+    /**
+     * 按 id 覆盖写入：有就替换、没有就追加。
+     *
+     * 流式输出靠它实现「草稿实时落盘」——每 0.7 秒把同一条消息用新文本覆盖，
+     * 而不是每次追加一条新的（那样会堆出一串半截消息）。
+     */
+    fun upsertMessage(message: GroupMessage) = lock {
+        mutateMessages(message.groupId) { arr ->
+            var replaced = false
+            for (i in 0 until arr.length()) {
+                if (arr.optJSONObject(i)?.optString("id") == message.id) {
+                    arr.put(i, messageJson(message))
+                    replaced = true
+                    break
+                }
+            }
+            if (!replaced) arr.put(messageJson(message))
+        }
     }
 
     /**
      * 重试前清掉该成员最近一条失败/半截的记录，聊天里不堆重复的失败消息。
      * 成功过的最终答复不动——那是要进上下文的历史。
      */
-    fun removeLastFailedMessage(groupId: String, memberId: String) {
+    fun removeLastFailedMessage(groupId: String, memberId: String) = lock {
         val f = messagesFile(groupId)
-        if (!f.exists()) return
+        if (!f.exists()) return@lock
         runCatching {
             val root = JSONObject(f.readText())
-            val arr = root.optJSONArray("messages") ?: return
+            val arr = root.optJSONArray("messages") ?: return@runCatching
             var idx = -1
             for (i in arr.length() - 1 downTo 0) {
                 val o = arr.optJSONObject(i) ?: continue
@@ -355,18 +381,72 @@ class GroupStore(context: Context) {
             }
             if (idx >= 0) {
                 arr.remove(idx)
-                f.writeText(root.toString())
+                writeAtomically(f, root.toString())
             }
         }
     }
 
-    fun clearMessages(groupId: String) {
+    fun clearMessages(groupId: String) = lock {
         runCatching { messagesFile(groupId).delete() }
+        Unit
+    }
+
+    /** 删掉指定消息（流式草稿没出字时清理用）。 */
+    fun removeMessage(groupId: String, messageId: String) = lock {
+        mutateMessages(groupId) { arr ->
+            for (i in arr.length() - 1 downTo 0) {
+                if (arr.optJSONObject(i)?.optString("id") == messageId) arr.remove(i)
+            }
+        }
     }
 
     // ---- 内部 -------------------------------------------------------------
 
     private fun messagesFile(groupId: String) = File(dir, "$groupId.messages.json")
+
+    /** 读 - 改 - 写三件套只在锁内调用。 */
+    private fun mutateMessages(groupId: String, block: (JSONArray) -> Unit) {
+        val f = messagesFile(groupId)
+        val root = if (f.exists()) {
+            runCatching { JSONObject(f.readText()) }.getOrNull() ?: JSONObject()
+        } else JSONObject()
+        val arr = root.optJSONArray("messages") ?: JSONArray()
+        block(arr)
+        root.put("messages", arr)
+        writeAtomically(f, root.toString())
+    }
+
+    private fun messageJson(message: GroupMessage): JSONObject = JSONObject()
+        .put("id", message.id)
+        .put("role", message.role)
+        .put("memberId", message.memberId ?: "")
+        .put("memberName", message.memberName ?: "")
+        .put("text", message.text)
+        .put("createdAt", message.createdAt)
+        .put("quoteMemberId", message.quoteMemberId ?: "")
+        .put("quotePreview", message.quotePreview ?: "")
+        .put("failed", message.failed)
+        .put("thinking", message.thinking ?: "")
+        .put("skipped", message.skipped)
+        .put("interrupted", message.interrupted)
+        .put("streaming", message.streaming)
+
+    /**
+     * 先写临时文件再改名。
+     *
+     * 直接 `writeText` 是「截断 + 重写」：写到一半被杀（用户切走、进程回收）就
+     * 留下半截 JSON，下次读不出来整段消息就没了。rename 在同一分区是原子的。
+     */
+    private fun writeAtomically(f: File, text: String) {
+        f.parentFile?.mkdirs()
+        val tmp = File(f.parentFile, f.name + ".tmp")
+        tmp.writeText(text)
+        if (!tmp.renameTo(f)) {
+            // rename 失败（极少见）：退回直接写，至少别丢内容
+            runCatching { f.writeText(text) }
+            tmp.delete()
+        }
+    }
 
     private fun readIndex(): JSONObject {
         if (!indexFile.exists()) return JSONObject()
@@ -374,8 +454,7 @@ class GroupStore(context: Context) {
     }
 
     private fun writeIndex(root: JSONObject) {
-        indexFile.parentFile?.mkdirs()
-        indexFile.writeText(root.toString())
+        writeAtomically(indexFile, root.toString())
     }
 }
 
