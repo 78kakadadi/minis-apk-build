@@ -111,7 +111,7 @@ class OpencodeProcessManager(
                 installer.clearService()
                 return StartResult.Failed(
                     StartFailure.HEALTH_TIMEOUT,
-                    "服务器已启动（端口 $port）但 /global/health 在 20 秒内未通过。",
+                    "服务器已启动（端口 ${hs.port}）但 /global/health 在 20 秒内未通过。",
                 )
             }
 
