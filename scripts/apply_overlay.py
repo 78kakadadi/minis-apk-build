@@ -377,21 +377,8 @@ def main() -> None:
         "// 群聊入口：长按新对话按钮 → 群聊",
     )
 
-    # 19b) DualFabRow 函数体开头：拿 context 给长按建群用
-    patch(
-        sessions,
-        "    // 群聊入口：长按新对话按钮 → 群聊\n"
-        "    onGroupChatClick: (String?) -> Unit,\n"
-        ") {",
-        "    // 群聊入口：长按新对话按钮 → 群聊\n"
-        "    onGroupChatClick: (String?) -> Unit,\n"
-        ") {\n"
-        "    val gcContext = androidx.compose.ui.platform.LocalContext.current",
-        "DualFabRow 群聊 context",
-        "val gcContext = androidx.compose.ui.platform.LocalContext.current",
-    )
-
     # 20) 长按新对话按钮 = 直接创建群聊并进入
+    # DualFabRow 函数体里本来就有 `val context = LocalContext.current`，直接用它。
     patch(
         sessions,
         "                    .combinedClickable(\n"
@@ -407,7 +394,7 @@ def main() -> None:
         "                        // 底部弹层还要再点一次「创建」，用户感知是「长按没用」。\n"
         "                        onLongClick = {\n"
         "                            onGroupChatClick(\n"
-        "                                pro.openminis.app.ext.group.GroupStore(gcContext).createGroup(\"\").id,\n"
+        "                                pro.openminis.app.ext.group.GroupStore(context).createGroup(\"\").id,\n"
         "                            )\n"
         "                        },\n"
         "                    ),",
