@@ -194,13 +194,7 @@ def main() -> None:
         "                onFreeTokenClick = { navController.safeNavigate(Routes.FREE_TOKEN) },\n"
         "                onHeatmapClick = { navController.safeNavigate(Routes.HEATMAP) },\n"
         "                onKeyPoolClick = { navController.safeNavigate(Routes.KEY_POOL) },\n"
-        "                onGroupChatClick = { groupId ->\n"
-        "                    // 主页点群聊卡片必须直达聊天界面：以前一律走不带 id 的\n"
-        "                    // GROUP_CHAT，先落到群列表，得多点一次才能进群——\n"
-        "                    // 返回时也要多退一页。带 id 走 GROUP_CHAT_ONE 直达。\n"
-        "                    if (groupId == null) navController.safeNavigate(Routes.GROUP_CHAT)\n"
-        "                    else navController.safeNavigate(Routes.groupChatWith(groupId))\n"
-        "                },\n"
+        "                onGroupChatClick = { navController.safeNavigate(Routes.GROUP_CHAT) },\n"
         "                onPluginClick = { navController.safeNavigate(Routes.PLUGINS) },\n"
         "                onDispatchClick = { navController.safeNavigate(Routes.DISPATCH) },\n",
         "扩展能力导航回调",
