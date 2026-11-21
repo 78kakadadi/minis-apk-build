@@ -89,6 +89,20 @@ jobs:
           test ! -d "$APP/src/main/java/com/openminis/app" \
             || { echo "旧包目录仍存在"; exit 1; }
 
+      # 桌面图标下显示的名字。app_name 在 23 个语言目录里各有一份
+      # （values / values-zh / values-de …），只改默认 values 的话，
+      # 中文系统的桌面仍然显示旧名——语言限定比默认 values 更具体。
+      - name: Set launcher label
+        run: |
+          set -euo pipefail
+          python3 scripts/set_app_name.py upstream/src/android/app "Minis Pro"
+          APP=upstream/src/android/app/src/main
+          echo "app_name 语言文件数：$(grep -rl 'name="app_name"' "$APP/res" | wc -l)"
+          if grep -rn 'name="app_name">Minis<' "$APP/res"; then
+            echo "仍有语言文件保留旧应用名"
+            exit 1
+          fi
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

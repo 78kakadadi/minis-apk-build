@@ -55,6 +55,18 @@ grep -q 'Java_pro_openminis_app_' app/src/main/cpp/pty_bridge.c
 test -f app/src/main/java/pro/openminis/app/MainActivity.kt
 ```
 
+## 桌面显示名
+
+桌面图标下显示 **Minis Pro**（`app_name`）。
+
+这个名字在 23 个语言目录里各有一份：`values`、`values-zh`、`values-de`、`values-zh-rTW`……
+Android 的语言限定比默认 `values` 更具体，所以只改默认值的话，中文系统的桌面
+仍然显示 `Minis`。`scripts/set_app_name.py` 会遍历全部 `values*/strings.xml`，
+改完再复查一遍每个文件的值，漏一个语言就直接失败。
+
+Manifest 里没有写死的 `android:label`，5 处都是 `@string/app_name`，改资源即全部生效。
+
+
 
 ## 触发
 
