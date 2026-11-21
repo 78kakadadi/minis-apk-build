@@ -213,7 +213,7 @@ class GroupChatEngine(
             order.take(MAX_SPEAKERS).map { memberId ->
                 launch {
                     val member = members.firstOrNull { it.id == memberId } ?: return@launch
-                    speakOne(group, member, history, text, quote, attachments, onEvent)
+                    speakOne(group, member, history, text, quote, attachments, onEvent = onEvent)
                 }
             }
         }
@@ -232,6 +232,8 @@ class GroupChatEngine(
         userText: String,
         quote: GroupMessage?,
         attachments: List<GroupAttachment>,
+        /** 用户手动点「重试」：跳过「这个任务适合我吗」的自检。 */
+        force: Boolean = false,
         onEvent: suspend (GroupEvent) -> Unit,
     ) {
         val persona = personas.get(member.personaId)
@@ -279,7 +281,7 @@ class GroupChatEngine(
         val taskForFit = userText.trim().ifBlank {
             attachments.joinToString("、") { it.name }.let { "用户发来了附件：$it" }
         }
-        if (group.autoTaskFit && shouldSkip(endpoint, persona, name, taskForFit)) {
+        if (!force && group.autoTaskFit && shouldSkip(endpoint, persona, name, taskForFit)) {
             onEvent(GroupEvent.MemberSkipped(member.id, name, "判断这个任务不适合自己"))
             store.appendMessage(
                 GroupMessage(
@@ -492,7 +494,12 @@ class GroupChatEngine(
         withContext(NonCancellable) {
             store.removeLastFailedMessage(groupId, memberId)
         }
-        speakOne(group, member, history, userMessage.text, quote, userMessage.attachments, onEvent)
+        speakOne(
+            group, member, history, userMessage.text, quote, userMessage.attachments,
+            // 用户已经明确要求重试，别再让自检把它跳过
+            force = true,
+            onEvent = onEvent,
+        )
     }
 
     private fun nameOf(members: List<GroupMemberDef>, id: String): String =

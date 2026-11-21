@@ -250,17 +250,21 @@ fun GroupChatScreen(
         val gid = currentId ?: return@LaunchedEffect
         while (true) {
             val running = GroupChatJobs.isRunning(gid)
-            if (running != busy) busy = running
+            if (running != busy) {
+                busy = running
+                if (!running) {
+                    // 任务刚结束：清掉流式气泡并刷新一次。就算这一轮一个字都没输出
+                    // （比如一开始就被打断），也要刷 —— 打断时的半截消息已经落盘了。
+                    pending = emptyMap()
+                    thinking = emptyMap()
+                    version++
+                }
+            }
             if (running) {
                 // 生成中跟着磁盘上的草稿刷新（退出再回来也能看到进度）
                 version++
                 delay(700)
             } else {
-                if (pending.isNotEmpty() || thinking.isNotEmpty()) {
-                    pending = emptyMap()
-                    thinking = emptyMap()
-                    version++
-                }
                 delay(400)
             }
         }
