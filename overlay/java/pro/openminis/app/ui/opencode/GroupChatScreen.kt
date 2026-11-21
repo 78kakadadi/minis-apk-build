@@ -6,10 +6,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,7 +21,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -33,9 +34,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -50,6 +54,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -67,13 +72,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -98,6 +106,8 @@ import pro.openminis.app.ext.opencode.runtime.GroupEndpointResolver
 import pro.openminis.app.ext.opencode.runtime.ProviderChoice
 import pro.openminis.app.ext.persona.PersonaFileStore
 import pro.openminis.app.ext.persona.PersonaRepository
+import pro.openminis.app.ui.markdown.MarkdownText
+import pro.openminis.app.ui.theme.ChatColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -111,7 +121,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
-private val GC_BLUE = Color(0xFF0A84FF)
 private val GC_ORANGE = Color(0xFFFF9F0A)
 private val GC_RED = Color(0xFFFF453A)
 
@@ -314,33 +323,52 @@ fun GroupChatScreen(
     }
 
     Scaffold(
+        containerColor = ChatColors.background,
         topBar = {
             TopAppBar(
+                colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
+                    containerColor = ChatColors.background,
+                ),
                 navigationIcon = {
                     // 返回 = 直接回上一页（主页）。以前先回到群列表，用户要按两次
                     // 才能退出——从主页进来的人只想一键回到主页。群列表仍可从
                     // 长按新对话按钮的入口进入。
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = ChatColors.primaryText,
+                        )
                     }
                 },
                 title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        AvatarStack(members)
-                        Spacer(Modifier.width(10.dp))
-                        Column {
-                            Text(group.name, style = MaterialTheme.typography.titleMedium)
+                    // 原版对话页的顶栏是居中的「标题 + 一行小字说明」，
+                    // 这里照此排：群名在上，成员数与策略在下。
+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = group.name,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = ChatColors.primaryText,
+                                maxLines = 1,
+                            )
                             Text(
                                 text = "${members.size} 位成员 · ${strategyLabel(group.strategy)}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 11.sp,
+                                color = ChatColors.secondaryText,
+                                maxLines = 1,
                             )
                         }
                     }
                 },
                 actions = {
                     IconButton(onClick = { showSettings = true }) {
-                        Icon(Icons.Filled.Settings, contentDescription = "群设置")
+                        Icon(
+                            Icons.Filled.Settings,
+                            contentDescription = "群设置",
+                            tint = ChatColors.secondaryText,
+                        )
                     }
                 },
             )
@@ -362,7 +390,7 @@ fun GroupChatScreen(
                     .weight(1f)
                     .fillMaxWidth(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    start = 14.dp, end = 14.dp, top = 10.dp, bottom = 10.dp,
+                    start = 16.dp, end = 16.dp, top = 8.dp, bottom = 14.dp,
                 ),
             ) {
                 items(visibleMessages, key = { it.id }) { m ->
@@ -584,40 +612,53 @@ private fun GroupListPane(
 
 @Composable
 private fun UserBubble(message: GroupMessage) {
-    Column(
+    // 版式对齐原版对话：靠右、最宽 80%、18dp 圆角、14×8 内边距、16.5sp 正文，
+    // 底色用 ChatColors.userBubble（不是聊天软件常见的高饱和蓝）——
+    // 在 Minis 里「我的消息」一直是这层浅灰/浅蓝灰，群聊没理由另起一套。
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 5.dp),
-        horizontalAlignment = Alignment.End,
+            .padding(top = 10.dp, bottom = 4.dp),
     ) {
-        message.quotePreview?.let {
-            Text(
-                text = "↩ ${it.take(60)}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        // 图片按发送顺序排在文字上方：群聊里最常看的是图本身，不是说明文字
-        message.attachments.filter { it.isImage }.forEach { a ->
-            AttachmentImage(
-                attachment = a,
-                modifier = Modifier
-                    .padding(vertical = 2.dp)
-                    .widthIn(max = 230.dp)
-                    .heightIn(max = 220.dp),
-            )
-        }
-        message.attachments.filterNot { it.isImage }.forEach { a ->
-            AttachmentFileChip(a, Modifier.padding(vertical = 2.dp))
-        }
-        if (message.text.isNotBlank()) {
-            Surface(color = GC_BLUE, shape = RoundedCornerShape(14.dp)) {
-                Text(
-                    text = message.text,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White,
-                )
+        val bubbleMax = maxWidth * 0.8f
+        Row(modifier = Modifier.fillMaxWidth()) {
+            Spacer(Modifier.weight(1f).widthIn(min = 60.dp))
+            Column(
+                modifier = Modifier.widthIn(max = bubbleMax),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                message.quotePreview?.let {
+                    Text(
+                        text = "↩ ${it.take(60)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ChatColors.secondaryText,
+                    )
+                }
+                // 图片按发送顺序排在文字上方：群聊里最常看的是图本身，不是说明文字
+                message.attachments.filter { it.isImage }.forEach { a ->
+                    AttachmentImage(
+                        attachment = a,
+                        modifier = Modifier
+                            .widthIn(max = 230.dp)
+                            .heightIn(max = 220.dp),
+                    )
+                }
+                message.attachments.filterNot { it.isImage }.forEach { a ->
+                    AttachmentFileChip(a)
+                }
+                if (message.text.isNotBlank()) {
+                    val shape = RoundedCornerShape(18.dp)
+                    Text(
+                        text = message.text,
+                        modifier = Modifier
+                            .background(ChatColors.userBubble, shape)
+                            .clip(shape)
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.5.sp),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
             }
         }
     }
@@ -625,7 +666,11 @@ private fun UserBubble(message: GroupMessage) {
 
 /** 聊天里显示一张图片。解码放到 IO 线程，避免大图把主线程卡住。 */
 @Composable
-private fun AttachmentImage(attachment: GroupAttachment, modifier: Modifier = Modifier) {
+private fun AttachmentImage(
+    attachment: GroupAttachment,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Fit,
+) {
     val bitmap by produceState<Bitmap?>(null, attachment.path) {
         value = withContext(Dispatchers.IO) { decodeThumbnail(attachment.path, 720) }
     }
@@ -635,20 +680,31 @@ private fun AttachmentImage(attachment: GroupAttachment, modifier: Modifier = Mo
             bitmap = bmp.asImageBitmap(),
             contentDescription = attachment.name,
             modifier = modifier.clip(RoundedCornerShape(12.dp)),
-            contentScale = ContentScale.Fit,
+            contentScale = contentScale,
         )
     } else {
         Surface(
-            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            color = ChatColors.inputIconBg,
             shape = RoundedCornerShape(10.dp),
             modifier = modifier,
         ) {
-            Text(
-                text = "🖼 ${attachment.name}（无法显示）",
+            Row(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.Image,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = ChatColors.secondaryText,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = "${attachment.name}（无法显示）",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ChatColors.secondaryText,
+                )
+            }
         }
     }
 }
@@ -657,7 +713,7 @@ private fun AttachmentImage(attachment: GroupAttachment, modifier: Modifier = Mo
 @Composable
 private fun AttachmentFileChip(attachment: GroupAttachment, modifier: Modifier = Modifier) {
     Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        color = ChatColors.inputIconBg,
         shape = RoundedCornerShape(10.dp),
         modifier = modifier,
     ) {
@@ -665,7 +721,12 @@ private fun AttachmentFileChip(attachment: GroupAttachment, modifier: Modifier =
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("📎", fontSize = 12.sp)
+            Icon(
+                Icons.AutoMirrored.Filled.InsertDriveFile,
+                contentDescription = null,
+                modifier = Modifier.size(15.dp),
+                tint = ChatColors.secondaryText,
+            )
             Spacer(Modifier.width(6.dp))
             Text(
                 text = attachment.name,
@@ -678,7 +739,7 @@ private fun AttachmentFileChip(attachment: GroupAttachment, modifier: Modifier =
                 Text(
                     text = size,
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = ChatColors.secondaryText,
                 )
             }
         }
@@ -696,21 +757,28 @@ private fun MemberBubble(
             message.memberName?.let { AiAvatars.initialOf(it) } ?: "AI",
             0xFF8E8E93.toInt(),
         )
-    Row(modifier = Modifier.padding(vertical = 6.dp)) {
-        MemberAvatar(spec, 34.dp)
-        Spacer(Modifier.width(8.dp))
+    // AI 回复不套气泡：原版对话里助手消息就是「头像 + 名字 + 正文」直接排在
+    // 背景上，只有用户消息才是一条气泡。群聊跟着这套版式，顺带让 Markdown
+    // （标题、列表、代码块）有完整宽度可用，不再被气泡内边距挤成窄条。
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp, bottom = 4.dp),
+    ) {
+        MemberAvatar(spec, 30.dp)
+        Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = message.memberName ?: "成员",
                     style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Medium,
+                    fontWeight = FontWeight.SemiBold,
                     color = Color(spec.color),
                 )
                 Text(
                     text = "  " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(message.createdAt)),
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = ChatColors.tertiaryText,
                 )
                 if (message.skipped) {
                     Text(
@@ -723,23 +791,38 @@ private fun MemberBubble(
                     Text(
                         text = " · 已停止",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = ChatColors.tertiaryText,
                     )
                 }
             }
             if (!message.thinking.isNullOrBlank()) {
                 ThinkingBlock(message.thinking)
             }
-            Surface(
-                color = if (message.failed) GC_RED.copy(alpha = 0.10f)
-                else MaterialTheme.colorScheme.surfaceContainerHigh,
-                shape = RoundedCornerShape(14.dp),
-            ) {
-                Text(
-                    text = message.text.ifBlank { "…" },
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (message.failed) GC_RED else MaterialTheme.colorScheme.onSurface,
+            if (message.failed) {
+                // 失败仍然是「一条助手消息」，只是底色提示它没成功；
+                // 正文按纯文本渲染，错误信息里的星号不该被当成 Markdown。
+                Surface(
+                    color = GC_RED.copy(alpha = 0.10f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp),
+                ) {
+                    Text(
+                        text = message.text.ifBlank { "…" },
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                        style = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.sp),
+                        color = GC_RED,
+                    )
+                }
+            } else {
+                MarkdownText(
+                    markdown = message.text.ifBlank { "…" },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.sp),
                 )
             }
             // 失败的消息带重试：不重发用户消息，只重新调用这位成员
@@ -761,31 +844,33 @@ private fun MemberBubble(
 
 @Composable
 private fun StreamingBubble(name: String, spec: AvatarSpec, text: String, thinking: String) {
-    Row(modifier = Modifier.padding(vertical = 6.dp)) {
-        MemberAvatar(spec, 34.dp)
-        Spacer(Modifier.width(8.dp))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp, bottom = 4.dp),
+    ) {
+        MemberAvatar(spec, 30.dp)
+        Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = name,
                     style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Medium,
+                    fontWeight = FontWeight.SemiBold,
                     color = Color(spec.color),
                 )
                 Spacer(Modifier.width(6.dp))
                 CircularProgressIndicator(modifier = Modifier.size(11.dp), strokeWidth = 1.5.dp)
             }
             if (thinking.isNotBlank()) ThinkingBlock(thinking)
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                shape = RoundedCornerShape(14.dp),
-            ) {
-                Text(
-                    text = text.ifBlank { "…" },
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+            MarkdownText(
+                markdown = text.ifBlank { "…" },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp),
+                color = MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.sp),
+            )
         }
     }
 }
@@ -803,14 +888,14 @@ private fun ThinkingBlock(text: String) {
         Text(
             text = if (expanded) "▾ 思考过程（仅你可见）" else "▸ 思考过程（仅你可见）",
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = ChatColors.tertiaryText,
         )
         if (expanded) {
             Text(
                 text = text,
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = ChatColors.secondaryText,
                 modifier = Modifier.padding(start = 6.dp, top = 2.dp, bottom = 4.dp),
             )
         }
@@ -834,132 +919,236 @@ private fun Composer(
     onStop: () -> Unit,
     onSend: () -> Unit,
 ) {
-    Surface(
-        color = MaterialTheme.colorScheme.surface,
-        shadowElevation = 8.dp,
+    // 版式照原版对话页的输入卡片：20dp 圆角、无描边、背景 = ChatColors.inputBg，
+    // 靠一层柔和阴影与消息流分开；控件全部排在文字下方一行（+ 号在左、
+    // 发送/停止在右）。以前是两个 emoji 竖在输入框左边，既不像 Minis，
+    // 也让输入框被挤短。
+    val cardShape = RoundedCornerShape(20.dp)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 10.dp, end = 10.dp, top = 2.dp, bottom = 8.dp)
+            .shadow(elevation = 4.dp, shape = cardShape, clip = false)
+            .background(ChatColors.inputBg, cardShape)
+            .padding(top = 8.dp, bottom = 4.dp),
     ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-            if (!bridgeReady) {
+        if (!bridgeReady) {
+            Text(
+                text = "免费通道未启用，成员会发不出消息：设置 › 免费 Token 通道",
+                style = MaterialTheme.typography.labelSmall,
+                color = GC_RED,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+            )
+        }
+        quote?.let { q ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(
-                    text = "免费通道未启用，成员会发不出消息：设置 › 免费 Token 通道",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = GC_RED,
-                    modifier = Modifier.padding(bottom = 4.dp),
-                )
-            }
-            quote?.let { q ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "引用 ${q.memberName ?: "消息"}：${q.text.take(40)}",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    TextButton(onClick = onClearQuote) { Text("取消") }
-                }
-            }
-            // 待发送的附件：先在这里排一排，发出去之前还能删
-            if (attachments.isNotEmpty()) {
-                Row(
-                    modifier = Modifier
-                        .horizontalScroll(rememberScrollState())
-                        .padding(bottom = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    attachments.forEach { a ->
-                        Box {
-                            if (a.isImage) {
-                                AttachmentImage(
-                                    attachment = a,
-                                    modifier = Modifier
-                                        .size(56.dp)
-                                        .clip(RoundedCornerShape(10.dp)),
-                                )
-                            } else {
-                                AttachmentFileChip(a)
-                            }
-                            IconButton(
-                                onClick = { onRemoveAttachment(a) },
-                                modifier = Modifier
-                                    .size(20.dp)
-                                    .align(Alignment.TopEnd)
-                                    .clip(CircleShape)
-                                    .background(Color(0xCC000000)),
-                            ) {
-                                Text("✕", color = Color.White, fontSize = 11.sp)
-                            }
-                        }
-                    }
-                }
-            }
-            Row(verticalAlignment = Alignment.Bottom) {
-                // 图片和文件分成两个入口：从相册选图是最常用的一条路，
-                // 混在一个「全部文件」里会多走好几步。
-                IconButton(
-                    onClick = onPickImage,
-                    enabled = !busy,
-                    modifier = Modifier.size(40.dp),
-                ) {
-                    Text(
-                        text = "🖼",
-                        fontSize = 18.sp,
-                        color = if (busy) Color(0xFFB0B0B5) else Color.Unspecified,
-                    )
-                }
-                IconButton(
-                    onClick = onPickFile,
-                    enabled = !busy,
-                    modifier = Modifier.size(40.dp),
-                ) {
-                    Text(
-                        text = "📎",
-                        fontSize = 18.sp,
-                        color = if (busy) Color(0xFFB0B0B5) else Color.Unspecified,
-                    )
-                }
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = onValueChange,
+                    text = "引用 ${q.memberName ?: "消息"}：${q.text.take(40)}",
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("发消息给群成员…") },
-                    maxLines = 5,
-                    shape = RoundedCornerShape(20.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ChatColors.secondaryText,
                 )
-                Spacer(Modifier.width(6.dp))
-                if (busy) {
-                    // 输出中：发送键换成停止键。打断后已输出的半截回复会保留在聊天里。
-                    IconButton(
-                        onClick = onStop,
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(CircleShape)
-                            .background(GC_RED),
-                    ) {
-                        Icon(Icons.Filled.Stop, contentDescription = "停止", tint = Color.White)
-                    }
-                } else {
-                    IconButton(
-                        onClick = onSend,
-                        enabled = value.isNotBlank() || attachments.isNotEmpty(),
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (value.isBlank() && attachments.isEmpty()) Color(0xFFB0B0B5) else GC_BLUE,
-                            ),
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送", tint = Color.White)
-                    }
+                TextButton(onClick = onClearQuote) { Text("取消", fontSize = 12.sp) }
+            }
+        }
+        // 待发送的附件：先在这里排一排，发出去之前还能删
+        if (attachments.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                attachments.forEach { a ->
+                    ComposerAttachmentChip(a) { onRemoveAttachment(a) }
                 }
             }
-            if (busy) {
+            Spacer(Modifier.height(4.dp))
+        }
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = {
                 Text(
-                    text = "成员同时发言中…（点 ■ 可打断，已输出的内容会保留）",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp),
+                    text = "发消息给群成员…",
+                    fontSize = 16.5.sp,
+                    color = ChatColors.primaryText.copy(alpha = 0.25f),
+                )
+            },
+            maxLines = 5,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.5.sp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Color.Transparent,
+                unfocusedBorderColor = Color.Transparent,
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+            ),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+        )
+        // Button row below text field（原版：左侧选图/选文件，右侧发送或停止）
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircleIconButton(onClick = onPickImage, enabled = !busy) {
+                Icon(
+                    Icons.Filled.Image,
+                    contentDescription = "发送图片",
+                    tint = ChatColors.primaryText.copy(alpha = 0.75f),
+                    modifier = Modifier.size(20.dp),
                 )
             }
+            Spacer(Modifier.width(8.dp))
+            CircleIconButton(onClick = onPickFile, enabled = !busy) {
+                Icon(
+                    Icons.AutoMirrored.Filled.InsertDriveFile,
+                    contentDescription = "发送文件",
+                    tint = ChatColors.primaryText.copy(alpha = 0.75f),
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            val canSend = value.isNotBlank() || attachments.isNotEmpty()
+            if (busy) {
+                // 输出中：发送键换成停止键。打断后已输出的半截回复会保留在聊天里。
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .background(Color(0xFFFF3B30), CircleShape)
+                        .clip(CircleShape)
+                        .clickable(onClick = onStop),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Filled.Stop,
+                        contentDescription = "停止",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .background(
+                            if (canSend) ChatColors.sendButton else ChatColors.sendButtonDisabled,
+                            CircleShape,
+                        )
+                        .clip(CircleShape)
+                        .clickable(enabled = canSend, onClick = onSend),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Filled.ArrowUpward,
+                        contentDescription = "发送",
+                        tint = if (canSend) ChatColors.background
+                        else ChatColors.primaryText.copy(alpha = 0.5f),
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 原版输入栏的 38dp 圆形图标按钮：浅底 + 发丝描边，按下即触发。 */
+@Composable
+private fun CircleIconButton(
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(38.dp)
+            .background(ChatColors.inputIconBg, CircleShape)
+            .border(0.5.dp, ChatColors.inputIconBorder, CircleShape)
+            .clip(CircleShape)
+            .clickable(enabled = enabled, onClick = onClick)
+            .then(if (enabled) Modifier else Modifier.alpha(0.45f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
+    }
+}
+
+/**
+ * 输入栏里的附件缩略图。
+ *
+ * 尺寸与徽章位置照原版 [AttachmentChip]：外框 72×70 给「✕」留出溢出的空间，
+ * 里面是 64dp 圆角方块，右上角是 20dp 的圆形移除键——徽章压在缩略图角上，
+ * 而不是整块图盖一个黑底叉号（那个黑底在小图上非常扎眼）。
+ */
+@Composable
+private fun ComposerAttachmentChip(attachment: GroupAttachment, onRemove: () -> Unit) {
+    val shape = RoundedCornerShape(8.dp)
+    Box(modifier = Modifier.size(width = 72.dp, height = 70.dp)) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .size(64.dp)
+                .clip(shape),
+        ) {
+            if (attachment.isImage) {
+                AttachmentImage(
+                    attachment = attachment,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(ChatColors.inputIconBg, shape)
+                        .border(1.dp, ChatColors.thumbnailBorder, shape),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.InsertDriveFile,
+                        contentDescription = null,
+                        tint = ChatColors.secondaryText,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = attachment.name,
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                        color = ChatColors.primaryText,
+                        maxLines = 2,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+                }
+            }
+        }
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .size(20.dp)
+                .background(ChatColors.background, CircleShape)
+                .border(0.5.dp, ChatColors.thumbnailBorder, CircleShape)
+                .clip(CircleShape)
+                .clickable(onClick = onRemove),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = "移除",
+                tint = ChatColors.primaryText.copy(alpha = 0.7f),
+                modifier = Modifier.size(13.dp),
+            )
         }
     }
 }
@@ -981,29 +1170,6 @@ private fun MemberAvatar(spec: AvatarSpec, size: Dp) {
             fontSize = if (spec.label.length >= 3) (size.value / 4.4f).sp else (size.value / 3.2f).sp,
             fontWeight = FontWeight.Bold,
         )
-    }
-}
-
-@Composable
-private fun AvatarStack(members: List<GroupMemberDef>) {
-    Row {
-        members.take(3).forEachIndexed { index, m ->
-            Box(
-                modifier = Modifier
-                    .offset(x = if (index == 0) 0.dp else (-8).dp)
-                    .size(26.dp)
-                    .clip(CircleShape)
-                    .background(Color(AiAvatars.resolve(m).color)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = AiAvatars.resolve(m).label,
-                    color = Color.White,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-        }
     }
 }
 

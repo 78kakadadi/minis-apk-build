@@ -8,12 +8,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -84,9 +87,17 @@ fun FreeTokenSettingsScreen(onBack: () -> Unit) {
     var showLogs by remember { mutableStateOf(false) }
     var logText by remember { mutableStateOf("") }
     var selectedModel by remember { mutableStateOf(manager.defaultModel) }
+    var confirmReinstall by remember { mutableStateOf(false) }
 
     // 用户上次启用过就自动拉起，否则停在「未启用」等一次明确点击
     LaunchedEffect(Unit) { manager.autoStartIfOptedIn() }
+
+    // 重装/换模型后服务端会给回新的默认模型，选中态跟着状态走，
+    // 否则列表里的高亮会停在重装前那个已经不存在的 id 上。
+    LaunchedEffect(status) {
+        val current = (status as? FreeTokenStatus.Running)?.model
+        if (current != null) selectedModel = current
+    }
 
     val running = status is FreeTokenStatus.Running
     val working = status is FreeTokenStatus.Working
@@ -337,6 +348,33 @@ fun FreeTokenSettingsScreen(onBack: () -> Unit) {
                             scope.launch(Dispatchers.IO) { manager.probeNow() }
                         }) { Text("探活") }
                     }
+
+                    // ---------- 重装 ----------
+                    // 「重启服务」只在进程层面兜底；配置文件被写坏、会话库卡死、
+                    // 端口/密码与 service.json 对不上这一类，重启多少次都没用，
+                    // 必须把运行时目录整个换掉。
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(
+                        onClick = { confirmReinstall = true },
+                        enabled = !working,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(
+                            Icons.Filled.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("重装 OpenCode 运行时")
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "会停止服务并删除本机的运行时配置、会话数据与日志，再重新初始化。" +
+                            "可执行文件随安装包提供，重装不会重新下载它。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
                     if (showLogs) {
                         Spacer(Modifier.height(8.dp))
                         Card(
@@ -356,6 +394,30 @@ fun FreeTokenSettingsScreen(onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    if (confirmReinstall) {
+        AlertDialog(
+            onDismissRequest = { confirmReinstall = false },
+            title = { Text("重装 OpenCode 运行时？") },
+            text = {
+                Text(
+                    "会停止本地服务，删除本机的 OpenCode 配置、会话数据与日志，" +
+                        "然后重新初始化并启动。\n\n" +
+                        "可执行文件由安装包提供，重装不会重新下载它；" +
+                        "如果它本身就缺失，只能重新安装这个 APK。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmReinstall = false
+                    manager.reinstall()
+                }) { Text("重装", color = ERR_RED) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmReinstall = false }) { Text("取消") }
+            },
+        )
     }
 }
 

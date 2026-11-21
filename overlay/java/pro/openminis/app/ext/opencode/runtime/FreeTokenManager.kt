@@ -197,6 +197,64 @@ class FreeTokenManager private constructor(context: Context) {
         }
     }
 
+    /**
+     * 重装运行时：停服务 → 删掉 `filesDir/opencode` 全部产物 → 清掉旧的模型登记 →
+     * 按首次安装的流程重新初始化并启动。
+     *
+     * 「重装」能做到什么、做不到什么，这里必须说清（UI 上也照此写）：
+     *  - 能：丢掉被写坏的 opencode.jsonc、卡住的 SQLite/会话快照、残留的
+     *    service.json 与日志，回到一份干净的运行时；
+     *  - 不能：重新下载二进制。`libopencode.so` 由系统从 APK 解压到
+     *    nativeLibraryDir，应用既无权也不该替换它。二进制真缺了，只能重装 APK。
+     *
+     * 先 `clear()` 再 `enable()`，而不是「删一半再补」：运行时的配置、认证密码、
+     * 会话库之间是有隐式绑定的，留一份半新半旧的数据比全删更容易出怪问题。
+     */
+    fun reinstall() {
+        scope.launch {
+            _status.value = FreeTokenStatus.Working("停止服务", 4)
+            bridgePort = 0
+            runCatching { bridge.stop() }
+            runCatching { process.stop() }
+
+            _status.value = FreeTokenStatus.Working("清理运行时数据", 12)
+            val cleared = installer.clear()
+            _models.value = emptyList()
+            modelError = null
+            store.lastError = null
+            store.lastPort = 0
+            // 默认模型也要重选：重装后服务端清单可能完全不同，留着旧 id 会让
+            // 聊天里选中一个不存在的模型，表现为「一发就 404」。
+            store.defaultModel = null
+            writeLog(
+                "reinstall",
+                "运行时目录清理：" + when (cleared) {
+                    is ClearResult.Cleared -> "已删除"
+                    is ClearResult.AlreadyEmpty -> "本就不存在"
+                    is ClearResult.Failed -> "失败 ${cleared.detail}"
+                },
+            )
+
+            // 旧的模型登记先摘掉：entries 指向的是上一次运行时的模型 id，
+            // 留着会在模型选择器里出现「点了就报错」的幽灵项。
+            runCatching { unregisterModels() }
+                .onFailure { writeLog("reinstall", "清理模型登记失败：${it.message}") }
+
+            enable()
+        }
+    }
+
+    /** 摘掉本通道注册过的模型 entry。实例本身保留（重装后 baseURL 会被更新）。 */
+    private fun unregisterModels() {
+        val repo = ProviderRepository(app)
+        runBlocking { try { repo.awaitConfigLoaded() } catch (e: Exception) { /* 读不到就按空配置继续 */ } }
+        val id = store.providerInstanceId ?: INSTANCE_ID
+        repo.entriesFor(id).forEach { entry ->
+            runCatching { repo.removeEntry(entry.id) }
+        }
+        writeLog("reinstall", "已清理模型登记 provider=$id")
+    }
+
     /** 换模型：桥接按请求里的 model 字段路由，这里只需记住默认值。 */
     fun selectModel(id: String) {
         store.defaultModel = id
