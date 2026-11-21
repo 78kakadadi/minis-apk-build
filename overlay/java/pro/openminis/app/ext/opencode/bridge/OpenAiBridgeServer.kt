@@ -3,6 +3,7 @@ package pro.openminis.app.ext.opencode.bridge
 import pro.openminis.app.ext.opencode.api.OpencodeServerClient
 import pro.openminis.app.ext.opencode.api.StreamEvent
 import pro.openminis.app.ext.opencode.model.FreeModel
+import pro.openminis.app.ext.group.GroupTools
 import pro.openminis.app.ext.opencode.runtime.ServiceConfig
 import pro.openminis.app.ext.usage.UsageCenter
 import pro.openminis.app.ext.usage.UsageEvent
@@ -221,7 +222,16 @@ class OpenAiBridgeServer(
         val stream = body.optBoolean("stream", false)
         val messages = body.optJSONArray("messages") ?: JSONArray()
 
-        val transcript = renderTranscript(messages)
+        // 群聊成员的工具白名单。字段存在即「有限制」——空数组表示禁用全部工具。
+        // 普通对话不带这个字段，行为完全不变。
+        val toolRule: Set<String>? = body.optJSONArray("x_minis_tools")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optString(i).takeIf { it.isNotBlank() }
+            }.toSet()
+        }
+
+        var transcript = renderTranscript(messages)
+        if (toolRule != null) transcript = toolScopePreamble(toolRule) + transcript
         if (transcript.isBlank()) {
             writeJson(out, 400, """{"error":{"message":"messages 内容为空"}}""")
             return
@@ -230,7 +240,11 @@ class OpenAiBridgeServer(
         // 2.x 的模型是在建会话时选定的，所以先把 id 映射回 {id, providerID}
         val target = resolveModel(model)
         val client = OpencodeServerClient(http, svc) { log(it) }
-        val sid = client.createSession(target, "minis-${System.currentTimeMillis()}")
+        val sid = client.createSession(
+            model = target,
+            title = "minis-${System.currentTimeMillis()}",
+            permissions = toolRule?.let { GroupTools.permissionRules(it) },
+        )
         val id = "chatcmpl-${seq.incrementAndGet()}"
         val created = System.currentTimeMillis() / 1000
 
@@ -514,6 +528,24 @@ class OpenAiBridgeServer(
             .put("choices", JSONArray().put(choice))
         out.write("data: $chunk\n\n".toByteArray(Charsets.UTF_8))
         out.flush()
+    }
+
+    /**
+     * 在 transcript 前声明这一轮的工具白名单。
+     *
+     * 会话权限是「硬拒」：模型真调用被禁的工具会被挡下来。但它会反复试，把一轮
+     * 对话耗在重试上。先把「这一轮有什么工具」说清楚，能消掉绝大多数无效尝试；
+     * 权限规则再兜住那些仍然要试的。
+     */
+    private fun toolScopePreamble(allowed: Set<String>): String {
+        if (allowed.isEmpty()) {
+            return "【工具】本轮你没有可用工具：不要调用任何工具，直接凭已有知识回答。\n\n"
+        }
+        val names = GroupTools.SPECS
+            .filter { it.id in allowed }
+            .joinToString("、") { "${it.label}(${it.id})" }
+        return "【工具】本轮只允许调用这些工具：$names。其他工具已禁用，不要尝试；" +
+            "不需要工具时直接回答。\n\n"
     }
 
     /**

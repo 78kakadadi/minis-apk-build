@@ -36,6 +36,14 @@ data class GroupMemberDef(
     val providerInstanceId: String = "",
     /** low / medium / high —— 只影响这个成员的思考强度，不影响别人。 */
     val reasoning: String = "medium",
+    /**
+     * 允许这个成员调用的工具 id（见 [GroupTools]）。
+     *
+     * `null` = 没设置过，等价于全部工具——旧群成员升级后不会突然失去能力；
+     * 显式空列表表示「禁用全部工具」。为什么不用空列表表示默认：那样无法区分
+     * 「用户主动关掉全部」和「从没设置过」，升级后会静默把工具关掉。
+     */
+    val tools: List<String>? = null,
     /** 头像字母（留空则按模型自动取厂商标识）。 */
     val avatarLabel: String = "",
     /** 头像底色 ARGB（0 = 按模型自动配色）。 */
@@ -207,6 +215,9 @@ class GroupStore(context: Context) {
                 source = o.optString("source").ifBlank { GroupMemberDef.SOURCE_FREE },
                 providerInstanceId = o.optString("providerInstanceId"),
                 reasoning = o.optString("reasoning").ifBlank { "medium" },
+                tools = o.optJSONArray("tools")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+                },
                 avatarLabel = o.optString("avatarLabel"),
                 avatarColor = o.optInt("avatarColor", 0),
             )
@@ -249,6 +260,13 @@ class GroupStore(context: Context) {
         o.put("source", member.source)
         o.put("providerInstanceId", member.providerInstanceId)
         o.put("reasoning", member.reasoning)
+        val tools = member.tools
+        if (tools == null) {
+            // 不写 key = 全部允许。必须 remove，否则重新设置成「全部」时旧数组会留着。
+            o.remove("tools")
+        } else {
+            o.put("tools", JSONArray(tools))
+        }
         o.put("avatarLabel", member.avatarLabel)
         o.put("avatarColor", member.avatarColor)
     }
@@ -270,6 +288,21 @@ class GroupStore(context: Context) {
 
     fun setMemberReasoning(memberId: String, reasoning: String) =
         updateMember(memberId) { it.put("reasoning", reasoning) }
+
+    /**
+     * 设置允许调用的工具。
+     *
+     * `null` 是「全部」而不是「无」——UI 上点「全选」时传 null，这样将来新增
+     * 工具会自动出现在这个成员的能力里，不需要用户再回来勾一次。
+     */
+    fun setMemberTools(memberId: String, tools: List<String>?) =
+        updateMember(memberId) {
+            if (tools == null) {
+                it.remove("tools")
+            } else {
+                it.put("tools", JSONArray(tools))
+            }
+        }
 
     fun setMemberAvatar(memberId: String, label: String, color: Int) =
         updateMember(memberId) {

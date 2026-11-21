@@ -19,6 +19,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 
 /** 群聊引擎向外抛的增量事件。UI 按成员分段渲染。 */
@@ -53,6 +54,14 @@ data class MemberEndpoint(
     val baseUrl: String,
     val apiKey: String,
     val model: String,
+    /**
+     * 这个成员允许调用的工具（[GroupTools] 的 id）。
+     *
+     * `null` = 不限制（老配置）；空集合 = 明确禁用全部工具。
+     */
+    val tools: Set<String>? = null,
+    /** 是否走本机免费通道（OpenCode）。免费通道的工具由 OpenCode 执行。 */
+    val isFree: Boolean = false,
 )
 
 fun interface MemberEndpointResolver {
@@ -82,10 +91,19 @@ class GroupChatEngine(
     private val personas: PersonaRepository,
     private val resolver: MemberEndpointResolver,
     private val http: OkHttpClient,
+    /**
+     * 「自己存的 API」成员执行工具的工作区。和免费通道共用
+     * `filesDir/opencode/workspace`，这样两种成员看到的是同一批文件。
+     */
+    workspace: File? = null,
 ) {
 
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
     private val planner = GroupTurnPlanner()
+    private val tools = GroupToolRunner(
+        workspace = workspace ?: File(System.getProperty("java.io.tmpdir") ?: ".", "minis-group-workspace"),
+        http = http,
+    )
 
     /** 给消息栏用：当前群可发言成员的人设名，避免 UI 再查一次仓库。 */
     fun memberViews(groupId: String): List<Pair<GroupMemberDef, Persona?>> =
@@ -290,6 +308,18 @@ class GroupChatEngine(
                         persistDraft(streaming = true)
                     }
                 },
+                // 工具块和正文一样进这条气泡：用户看得见「调用了什么、结果是什么」，
+                // 落盘之后切走再回来也还在。
+                onTool = { block ->
+                    reply.append(block)
+                    onEvent(GroupEvent.MemberDelta(member.id, block))
+                    val now = System.currentTimeMillis()
+                    if (now - lastPersistAt >= STREAM_PERSIST_MS) {
+                        lastPersistAt = now
+                        persistDraft(streaming = true)
+                    }
+                },
+                allowedTools = GroupTools.allowed(member),
             )
         } catch (e: CancellationException) {
             // 打断：半截回复落盘（没字就把草稿删掉，别留空壳），再把取消抛回去
@@ -499,6 +529,16 @@ class GroupChatEngine(
 
     // ---- 流式调用 ----------------------------------------------------------
 
+    /**
+     * 单个成员的一次完整生成。
+     *
+     * 两条来源的工具执行方式完全不同：
+     *
+     *  - **免费通道**：工具由 OpenCode 在设备上执行，白名单通过会话权限下发，
+     *    桥接把「调用了什么、结果是什么」渲染进正文；
+     *  - **自己存的 API**：上游只会返回 `tool_calls`，没有任何执行能力，
+     *    由 [GroupToolRunner] 在本机执行后回填，循环到模型不再调用为止。
+     */
     private suspend fun streamMember(
         endpoint: MemberEndpoint,
         persona: Persona?,
@@ -509,6 +549,8 @@ class GroupChatEngine(
         quote: GroupMessage?,
         onDelta: suspend (String) -> Unit,
         onThinking: suspend (String) -> Unit,
+        onTool: suspend (String) -> Unit,
+        allowedTools: Set<String>,
     ): TokenUsage? {
         val messages = historyMessages(history, member)
         val current = buildString {
@@ -527,13 +569,133 @@ class GroupChatEngine(
             messages.optJSONObject(i)?.let { full.put(it) }
         }
 
+        if (endpoint.isFree) {
+            // null = 用户没限制过，等价于 OpenCode 的默认全开；显式集合才下推权限。
+            val rule = endpoint.tools
+            return streamOnce(
+                endpoint = endpoint,
+                messages = full,
+                tools = null,
+                freeToolRule = rule,
+                onDelta = onDelta,
+                onThinking = onThinking,
+            ).usage
+        }
+
+        return streamWithTools(
+            endpoint = endpoint,
+            messages = full,
+            allowed = allowedTools,
+            onDelta = onDelta,
+            onThinking = onThinking,
+            onTool = onTool,
+        )
+    }
+
+    /**
+     * 直连 API 的工具循环。
+     *
+     * `tool_calls` 必须原样回填成 assistant 消息，再逐条补 `role=tool` 的结果——
+     * 少一条上游就会 400，这是 OpenAI 协议里最容易踩的坑。
+     */
+    private suspend fun streamWithTools(
+        endpoint: MemberEndpoint,
+        messages: JSONArray,
+        allowed: Set<String>,
+        onDelta: suspend (String) -> Unit,
+        onThinking: suspend (String) -> Unit,
+        onTool: suspend (String) -> Unit,
+    ): TokenUsage? {
+        // 只声明本机真的能执行的工具；联网搜索没有可靠后端，不在此列。
+        val localOnly = allowed.intersect(
+            setOf(
+                GroupTools.READ, GroupTools.EDIT, GroupTools.GLOB,
+                GroupTools.GREP, GroupTools.SHELL, GroupTools.WEBFETCH,
+            ),
+        )
+        val declarations = GroupTools.openAiTools(localOnly)
+        var total: TokenUsage? = null
+
+        for (round in 0 until MAX_TOOL_ROUNDS) {
+            val res = streamOnce(
+                endpoint = endpoint,
+                messages = messages,
+                tools = declarations.takeIf { it.length() > 0 },
+                freeToolRule = null,
+                onDelta = onDelta,
+                onThinking = onThinking,
+            )
+            total = when {
+                res.usage == null -> total
+                total == null -> res.usage
+                else -> total + res.usage!!
+            }
+
+            if (res.calls.isEmpty()) break
+            if (round == MAX_TOOL_ROUNDS - 1) {
+                onTool("\n\n（本轮工具调用达到上限 $MAX_TOOL_ROUNDS 次，已停止继续调用）\n\n")
+                break
+            }
+
+            val callsJson = JSONArray()
+            res.calls.values.forEach { c ->
+                callsJson.put(
+                    JSONObject()
+                        .put("id", c.id)
+                        .put("type", "function")
+                        .put(
+                            "function",
+                            JSONObject().put("name", c.name).put("arguments", c.args.toString()),
+                        ),
+                )
+            }
+            messages.put(
+                JSONObject()
+                    .put("role", "assistant")
+                    .put("content", res.text.toString())
+                    .put("tool_calls", callsJson),
+            )
+
+            for (c in res.calls.values) {
+                val argsObj = runCatching {
+                    JSONObject(c.args.toString().ifBlank { "{}" })
+                }.getOrNull()
+                val result = tools.execute(c.name, c.args.toString(), localOnly)
+                messages.put(
+                    JSONObject()
+                        .put("role", "tool")
+                        .put("tool_call_id", c.id)
+                        .put("name", c.name)
+                        .put("content", result.output),
+                )
+                onTool(GroupTools.renderToolBlock(c.name, argsObj, result.output, result.isError))
+            }
+        }
+        return total
+    }
+
+    /** 一次流式请求（不含工具循环）。tool_calls 按 index 累积成完整调用。 */
+    private suspend fun streamOnce(
+        endpoint: MemberEndpoint,
+        messages: JSONArray,
+        tools: JSONArray?,
+        freeToolRule: Set<String>?,
+        onDelta: suspend (String) -> Unit,
+        onThinking: suspend (String) -> Unit,
+    ): RoundResult {
         val body = JSONObject()
             .put("model", endpoint.model)
             .put("stream", true)
             .put("temperature", 0.7)
             // 兼容 OpenAI 标准端点：最后一块带 usage。不认识的端点会忽略它。
             .put("stream_options", JSONObject().put("include_usage", true))
-            .put("messages", full)
+            .put("messages", messages)
+        if (tools != null && tools.length() > 0) body.put("tools", tools)
+        if (freeToolRule != null) {
+            // 桥接的私有扩展：转成 OpenCode 的会话权限。OpenAI 兼容端点不会看到
+            // 这个字段（只有免费通道会走桥接）。
+            body.put("x_minis_tools", JSONArray(freeToolRule.toList()))
+        }
 
         val req = Request.Builder()
             .url("${endpoint.baseUrl}/chat/completions")
@@ -545,10 +707,10 @@ class GroupChatEngine(
         // 用户点「停止」时协程被取消，但 readUtf8Line 是阻塞的 socket 读——
         // 不主动断连的话读线程会一直挂到 readTimeout。协程一完成（含取消）
         // 就 cancel 连接，阻塞读立刻抛 IOException 退出。
+        val result = RoundResult()
         val call = http.newCall(req)
         val job = currentCoroutineContext()[Job]
         val onDone = job?.invokeOnCompletion { call.cancel() }
-        var usage: TokenUsage? = null
         try {
             call.execute().use { resp ->
                 if (!resp.isSuccessful) {
@@ -567,7 +729,7 @@ class GroupChatEngine(
                     }
                     // include_usage 的最后一块：choices 为空、usage 有值
                     obj.optJSONObject("usage")?.let { u ->
-                        usage = TokenUsage(
+                        result.usage = TokenUsage(
                             input = u.optLong("prompt_tokens"),
                             output = u.optLong("completion_tokens"),
                             cacheRead = u.optJSONObject("prompt_tokens_details")?.optLong("cached_tokens") ?: 0L,
@@ -576,16 +738,46 @@ class GroupChatEngine(
                     val choices = obj.optJSONArray("choices") ?: continue
                     val delta = choices.optJSONObject(0)?.optJSONObject("delta") ?: continue
                     val piece = delta.optString("content", "")
-                    if (piece.isNotEmpty()) onDelta(piece)
+                    if (piece.isNotEmpty()) {
+                        result.text.append(piece)
+                        onDelta(piece)
+                    }
                     val reason = delta.optString("reasoning_content", "")
                     if (reason.isNotEmpty()) onThinking(reason)
+                    delta.optJSONArray("tool_calls")?.let { tcs ->
+                        for (i in 0 until tcs.length()) {
+                            val tc = tcs.optJSONObject(i) ?: continue
+                            val idx = if (tc.has("index")) tc.optInt("index") else i
+                            val draft = result.calls.getOrPut(idx) { ToolCallDraft() }
+                            tc.optString("id").takeIf { it.isNotBlank() }?.let { draft.id = it }
+                            val fn = tc.optJSONObject("function") ?: continue
+                            fn.optString("name").takeIf { it.isNotBlank() }?.let { draft.name = it }
+                            fn.optString("arguments").takeIf { it.isNotEmpty() }?.let { draft.args.append(it) }
+                        }
+                    }
                 }
             }
         } finally {
             onDone?.dispose()
             call.cancel()
         }
-        return usage
+        // 部分兼容端点不给 id / index，补一个稳定的，否则回填 tool 消息会被拒
+        result.calls.forEach { (idx, c) ->
+            if (c.id.isBlank()) c.id = "call_${idx}_${System.currentTimeMillis()}"
+        }
+        return result
+    }
+
+    private class ToolCallDraft {
+        var id: String = ""
+        var name: String = ""
+        val args = StringBuilder()
+    }
+
+    private class RoundResult {
+        val text = StringBuilder()
+        val calls = LinkedHashMap<Int, ToolCallDraft>()
+        var usage: TokenUsage? = null
     }
 
     companion object {
@@ -597,5 +789,8 @@ class GroupChatEngine(
 
         /** 流式草稿落盘节流：每个字都写文件会把 IO 打满。 */
         const val STREAM_PERSIST_MS = 700L
+
+        /** 一条回复里最多允许模型来回调用几轮工具，防止死循环烧 token。 */
+        const val MAX_TOOL_ROUNDS = 6
     }
 }

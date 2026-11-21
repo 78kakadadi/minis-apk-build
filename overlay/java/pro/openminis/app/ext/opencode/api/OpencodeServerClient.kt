@@ -87,15 +87,15 @@ class OpencodeServerClient(
      * 2.x 的模型选择发生在建会话时（`Model.Ref{id, providerID}`），不是发送时；
      * 所以每轮「独立会话」的做法天然不会串模型。
      */
-    fun createSession(model: FreeModel, title: String): String {
+    fun createSession(model: FreeModel, title: String, permissions: JSONArray? = null): String {
         val payload = JSONObject()
             .put("model", JSONObject().put("id", model.id).put("providerID", model.providerId))
             .put("title", title)
-            .toString()
+        if (permissions != null) payload.put("permissions", permissions)
         val req = Request.Builder()
             .url("${svc.baseUrl}/api/session")
             .header("Authorization", svc.authorization)
-            .post(payload.toRequestBody(jsonMedia))
+            .post(payload.toString().toRequestBody(jsonMedia))
             .build()
         http.newCall(req).execute().use { resp ->
             val text = resp.body?.string().orEmpty()

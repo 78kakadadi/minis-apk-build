@@ -77,6 +77,7 @@ import pro.openminis.app.ext.group.GroupEvent
 import pro.openminis.app.ext.group.GroupMemberDef
 import pro.openminis.app.ext.group.GroupMessage
 import pro.openminis.app.ext.group.GroupStore
+import pro.openminis.app.ext.group.GroupTools
 import pro.openminis.app.ext.group.TurnStrategy
 import pro.openminis.app.ext.opencode.runtime.FreeTokenManager
 import pro.openminis.app.ext.opencode.runtime.GroupEndpointResolver
@@ -88,6 +89,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -135,7 +137,16 @@ fun GroupChatScreen(
             .readTimeout(300, TimeUnit.SECONDS)
             .build()
     }
-    val engine = remember { GroupChatEngine(store, personas, resolver, http) }
+    val engine = remember {
+        GroupChatEngine(
+            store = store,
+            personas = personas,
+            resolver = resolver,
+            http = http,
+            // 与免费通道共用同一个工作区：两种来源的成员看到的是同一批文件
+            workspace = File(appContext.filesDir, "opencode/workspace"),
+        )
+    }
 
     var version by remember { mutableStateOf(0) }
     var currentId by remember { mutableStateOf(initialGroupId) }
@@ -795,6 +806,66 @@ private fun EmptyMembersHint(onAdd: () -> Unit) {
 
 // ─── 群设置 ─────────────────────────────────────────────────────────────────
 
+/**
+ * 成员的工具白名单。
+ *
+ * 勾选是「允许」，不是「强制」：模型可以不用。全部不勾等于彻底禁用这个成员的工具，
+ * 它就只能靠自己的知识回答——在群聊里这往往是更安全的选择。
+ */
+@Composable
+private fun MemberToolsRow(member: GroupMemberDef, onSet: (Set<String>) -> Unit) {
+    val allowed = GroupTools.allowed(member)
+    Column(modifier = Modifier.fillMaxWidth().padding(top = 2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("可调用工具", style = MaterialTheme.typography.labelSmall)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = GroupTools.summary(member),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = { onSet(GroupTools.ALL_IDS) }) { Text("全开", fontSize = 11.sp) }
+            TextButton(onClick = { onSet(emptySet()) }) { Text("关闭", fontSize = 11.sp) }
+        }
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            GroupTools.SPECS
+                // 联网搜索是 OpenCode 的能力，自己存的 API 没有本地搜索后端
+                .filter { !(it.freeOnly && member.source == GroupMemberDef.SOURCE_PROVIDER) }
+                .forEach { spec ->
+                    val on = spec.id in allowed
+                    FilterChip(
+                        selected = on,
+                        onClick = {
+                            val next = allowed.toMutableSet()
+                            if (on) next.remove(spec.id) else next.add(spec.id)
+                            onSet(next)
+                        },
+                        label = {
+                            Text(
+                                text = spec.label,
+                                fontSize = 11.sp,
+                                color = if (on && spec.danger) GC_ORANGE else Color.Unspecified,
+                            )
+                        },
+                    )
+                }
+        }
+        Text(
+            text = if (member.source == GroupMemberDef.SOURCE_PROVIDER) {
+                "工具在本机应用私有工作区执行，越界路径会被拒绝；联网搜索仅免费通道可用。"
+            } else {
+                "工具由免费通道在本机执行；写文件、执行命令会在回复里留下可见记录。"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun GroupSettingsSheet(
@@ -943,6 +1014,17 @@ private fun GroupSettingsSheet(
                                 )
                             }
                         }
+                        MemberToolsRow(
+                            member = m,
+                            onSet = { next ->
+                                // 全选写回 null：将来新增工具会自动出现在这个成员身上
+                                store.setMemberTools(
+                                    m.id,
+                                    if (next.containsAll(GroupTools.ALL_IDS)) null else next.sorted(),
+                                )
+                                onChange()
+                            },
+                        )
                     }
                 }
             }

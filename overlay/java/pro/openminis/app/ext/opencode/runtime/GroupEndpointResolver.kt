@@ -49,13 +49,25 @@ class GroupEndpointResolver(
             val key = repo.loadApiKey(instance.id).orEmpty()
             val model = member.modelId.ifBlank { repo.entriesFor(instance.id).firstOrNull()?.baseModel?.id.orEmpty() }
             if (model.isBlank()) return null
-            return MemberEndpoint(base.trimEnd('/'), key, model)
+            return MemberEndpoint(
+                baseUrl = base.trimEnd('/'),
+                apiKey = key,
+                model = model,
+                tools = member.tools?.toSet(),
+                isFree = false,
+            )
         }
 
         val base = freeBaseUrl() ?: return null
         val model = member.modelId.ifBlank { freeModels().firstOrNull()?.id.orEmpty() }
         if (model.isBlank()) return null
-        return MemberEndpoint(base.trimEnd('/'), "local", model)
+        return MemberEndpoint(
+            baseUrl = base.trimEnd('/'),
+            apiKey = "local",
+            model = model,
+            tools = member.tools?.toSet(),
+            isFree = true,
+        )
     }
 
     private fun isOpenAiCompatible(type: ProviderType): Boolean = when (type) {
