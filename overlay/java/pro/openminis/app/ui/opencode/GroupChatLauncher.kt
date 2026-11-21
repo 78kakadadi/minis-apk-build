@@ -186,7 +186,7 @@ fun GroupChatFabHint() {
             shadowElevation = 2.dp,
         ) {
             Text(
-                text = "长按左下角的新对话按钮，可以创建群聊",
+                text = "长按左下角的新对话按钮，可以直接创建群聊",
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSecondaryContainer,

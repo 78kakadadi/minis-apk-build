@@ -63,6 +63,8 @@ data class GroupMessage(
     val thinking: String? = null,
     /** 成员自检「不适合自己」而跳过本轮。 */
     val skipped: Boolean = false,
+    /** 用户主动打断时留下的半截回复。 */
+    val interrupted: Boolean = false,
 ) {
     val isUser: Boolean get() = role == "user"
 }
@@ -297,6 +299,7 @@ class GroupStore(context: Context) {
                 failed = o.optBoolean("failed", false),
                 thinking = o.optString("thinking").ifBlank { null },
                 skipped = o.optBoolean("skipped", false),
+                interrupted = o.optBoolean("interrupted", false),
             )
         }
     }
@@ -322,11 +325,39 @@ class GroupStore(context: Context) {
                 .put("quotePreview", message.quotePreview ?: "")
                 .put("failed", message.failed)
                 .put("thinking", message.thinking ?: "")
-                .put("skipped", message.skipped),
+                .put("skipped", message.skipped)
+                .put("interrupted", message.interrupted),
         )
         root.put("messages", arr)
         f.parentFile?.mkdirs()
         f.writeText(root.toString())
+    }
+
+    /**
+     * 重试前清掉该成员最近一条失败/半截的记录，聊天里不堆重复的失败消息。
+     * 成功过的最终答复不动——那是要进上下文的历史。
+     */
+    fun removeLastFailedMessage(groupId: String, memberId: String) {
+        val f = messagesFile(groupId)
+        if (!f.exists()) return
+        runCatching {
+            val root = JSONObject(f.readText())
+            val arr = root.optJSONArray("messages") ?: return
+            var idx = -1
+            for (i in arr.length() - 1 downTo 0) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.optString("memberId") == memberId && o.optString("role") == "assistant" &&
+                    (o.optBoolean("failed") || o.optBoolean("interrupted"))
+                ) {
+                    idx = i
+                    break
+                }
+            }
+            if (idx >= 0) {
+                arr.remove(idx)
+                f.writeText(root.toString())
+            }
+        }
     }
 
     fun clearMessages(groupId: String) {

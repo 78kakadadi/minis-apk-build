@@ -4,6 +4,13 @@ import pro.openminis.app.ext.opencode.api.OpencodeServerClient
 import pro.openminis.app.ext.opencode.api.StreamEvent
 import pro.openminis.app.ext.opencode.model.FreeModel
 import pro.openminis.app.ext.opencode.runtime.ServiceConfig
+import pro.openminis.app.ext.usage.UsageCenter
+import pro.openminis.app.ext.usage.UsageEvent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import org.json.JSONArray
@@ -232,13 +239,45 @@ class OpenAiBridgeServer(
         val text = StringBuilder()
         var finished = false
         var failure: String? = null
+        var started = false
+        // 最近一次收到本会话事件的时间。opencode 的事件流会持续发 `: heartbeat`
+        // 保活帧，readTimeout 永远不会触发——如果某轮 answered 后结束事件丢失，
+        // 没有 watchdog 的话这次请求就永远收不到 [DONE]，用户看到的就是
+        // 「回答完了，对话却不结束」。90 秒全静默（连 delta/thinking 都没有）
+        // 只可能是服务端挂了，强制收尾。
+        var lastEventAt = System.currentTimeMillis()
+        // usage 快照：session.usage.updated 会在结束事件前后各发一次，收到就记
+        var usageSeen: pro.openminis.app.ext.opencode.api.TokenUsage? = null
+        val actualModel = target.id
 
         runBlocking {
+            val collector = this
+            val watchdog = launch(Dispatchers.Default) {
+                while (isActive) {
+                    delay(2000)
+                    if (finished || failure != null) break
+                    if (started && System.currentTimeMillis() - lastEventAt > IDLE_TIMEOUT_MS) {
+                        // 强制收尾：正文可能已经流完了（客户端收到过 delta），只差
+                        // 结束块。把 finished 置上让 finally 正常给上游发 [DONE]。
+                        if (text.isNotBlank()) {
+                            finished = true
+                            if (stream) emitDelta(out, id, created, model, null, "stop", null)
+                        } else {
+                            failure = "opencode $IDLE_TIMEOUT_MS/1000 秒没有任何事件，连接被重置"
+                        }
+                        log("watchdog 强制收尾（model=$actualModel）")
+                        collector.cancel()
+                        break
+                    }
+                }
+            }
             try {
                 client.events(sid).collect { ev ->
+                    lastEventAt = System.currentTimeMillis()
                     when (ev) {
                         // 连接建立后才发 prompt：否则首包 text.delta 会比订阅更早到，正文就丢了
                         StreamEvent.Started -> {
+                            started = true
                             try {
                                 client.prompt(sid, transcript)
                             } catch (e: Exception) {
@@ -258,6 +297,7 @@ class OpenAiBridgeServer(
                             if (stream) emitDelta(out, id, created, model, null, ev.stopReason, null)
                         }
                         is StreamEvent.Failed -> failure = ev.message
+                        is StreamEvent.UsageTotal -> usageSeen = ev.usage
                         else -> Unit
                     }
                     if (finished || failure != null) throw StopStream()
@@ -268,7 +308,37 @@ class OpenAiBridgeServer(
             } catch (e: Exception) {
                 failure = failure ?: (e.message ?: e.javaClass.simpleName)
             } finally {
+                watchdog.cancel()
                 client.deleteSession(sid)
+            }
+        }
+
+        // 免费通道的真实用量进热力图。普通对话与群聊的免费成员都经过这里，
+        // 是「免费 token 不计入用量」的修复点。usage 缺席时也记一条请求
+        //（tokenReported=false，热力图会标注「该通道未提供用量」）。
+        runCatching {
+            val u = usageSeen
+            if (u != null && !u.isEmpty) {
+                UsageCenter.record(
+                    UsageEvent(
+                        provider = "opencode",
+                        model = actualModel,
+                        usage = u,
+                        timestamp = System.currentTimeMillis(),
+                        sessionId = sid,
+                    ),
+                )
+            } else {
+                UsageCenter.record(
+                    UsageEvent(
+                        provider = "opencode",
+                        model = actualModel,
+                        usage = pro.openminis.app.ext.opencode.api.TokenUsage.ZERO,
+                        timestamp = System.currentTimeMillis(),
+                        sessionId = sid,
+                        tokenReported = false,
+                    ),
+                )
             }
         }
 
@@ -406,5 +476,12 @@ class OpenAiBridgeServer(
     companion object {
         /** 供 UI 展示的固定路径说明。 */
         const val PATH = "/v1/chat/completions"
+
+        /**
+         * 事件流全静默的兜底上限。正常推理不会全程静默这么久（thinking/delta
+         * 都会刷新计时）；超过只说明服务端挂了。heartbeat 保活帧不会刷新计时，
+         * 所以 readTimeout 在这条路径上失效，只能靠它。
+         */
+        const val IDLE_TIMEOUT_MS = 90_000L
     }
 }

@@ -63,6 +63,12 @@ class FreeTokenManager private constructor(context: Context) {
     private val layout = OpencodeLayout(app.filesDir)
     private val installer = OpencodeRuntimeInstaller(layout)
     private val process = OpencodeProcessManager(installer, layout)
+
+    init {
+        // 热力图 / Token 用量的持久化宿主：单例创建时恢复历史事件
+        pro.openminis.app.ext.usage.UsageCenter.init(app)
+    }
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(180, java.util.concurrent.TimeUnit.SECONDS)

@@ -30,19 +30,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import pro.openminis.app.ext.opencode.api.TokenUsage
 import pro.openminis.app.ext.usage.TokenHeatmap
-import pro.openminis.app.ext.usage.UsageEvent
+import pro.openminis.app.ext.usage.UsageCenter
 import java.time.LocalDate
-import java.time.ZoneId
-import kotlin.random.Random
 
 /**
  * Token 使用热力图（规格 §6）。
  *
- * 数据层是 [TokenHeatmap] 的真实聚合，不是画一张假图：
- * 方格颜色由 `level()` 的对数分档决定，明细按模型拆分并算占比。
- *
- * 由于当前还没有把 Agent 调用的 usage 接到这里（那要改 ChatViewModel 的调用点），
- * 提供「载入演示数据」只是为了验证渲染与聚合正确，数据本身明确标注为演示。
+ * 数据来自 [UsageCenter] 的真实采集：免费通道由 bridge 在收到 opencode 的
+ * `session.usage.updated` 时记账，群聊里绑定已存 API 的成员由群聊引擎记账。
+ * 每一格都是真实调用，不再提供演示数据。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,11 +46,12 @@ fun TokenHeatmapScreen(
     onBack: () -> Unit,
 ) {
     val today = remember { LocalDate.now() }
-    val heatmap = remember { TokenHeatmap() }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    remember(context) { pro.openminis.app.ext.usage.UsageCenter.ensureInit(context) }
+    val heatmap = remember { UsageCenter.heatmap() }
     // 聚合结果是普通对象，用版本号触发重组
     var version by remember { mutableStateOf(0) }
     var range by remember { mutableStateOf(TokenHeatmap.Range.ALL) }
-    var demoLoaded by remember { mutableStateOf(false) }
 
     val buckets = remember(version, range) { heatmap.rangeBuckets(range, today) }
     // Canvas 只关心每天的 token 数，这里把 DayBucket 投影成 Long，避免 UI 层持有聚合对象
@@ -87,11 +84,7 @@ fun TokenHeatmapScreen(
         ) {
             ExtCard(
                 title = "近 26 周",
-                subtitle = if (demoLoaded) {
-                    "当前为演示数据，用于验证聚合与色阶渲染"
-                } else {
-                    "尚无真实调用数据。接入 Agent 调用点后此处自动填充。"
-                },
+                subtitle = "免费通道与群聊成员的真实调用用量，逐次记账",
             ) {
                 HeatmapCanvas(columns = columns)
                 Spacer(Modifier.height(10.dp))
@@ -99,15 +92,7 @@ fun TokenHeatmapScreen(
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = {
-                        loadDemo(heatmap, today)
-                        demoLoaded = true
-                        version += 1
-                    }) {
-                        Text("载入演示数据")
-                    }
-                    Button(onClick = {
-                        heatmap.clear()
-                        demoLoaded = false
+                        UsageCenter.clearAll()
                         version += 1
                     }) {
                         Text("清空")
@@ -195,36 +180,4 @@ internal fun formatCount(n: Long): String {
         sb.append(c)
     }
     return sb.reverse().toString()
-}
-
-/**
- * 生成可复现的演示数据：固定种子，同一天总是同样的量，方便目视校验色阶。
- * 刻意让周末偏少，这样色阶的层次才看得出来。
- */
-private fun loadDemo(heatmap: TokenHeatmap, today: LocalDate) {
-    heatmap.clear()
-    val rnd = Random(20261120)
-    val models = listOf("deepseek-v4-flash-free", "big-pickle", "claude-sonnet-4")
-    for (i in 0 until 182) {
-        val date = today.minusDays(i.toLong())
-        val weekday = date.dayOfWeek.value
-        if (weekday >= 6 && rnd.nextInt(100) < 55) continue
-        if (rnd.nextInt(100) < 12) continue
-        val calls = rnd.nextInt(1, 6)
-        repeat(calls) {
-            val model = models[rnd.nextInt(models.size)]
-            val input = rnd.nextLong(200, 12_000)
-            val output = rnd.nextLong(100, 4_000)
-            val cacheRead = if (rnd.nextBoolean()) rnd.nextLong(0, 6_000) else 0L
-            heatmap.record(
-                UsageEvent(
-                    provider = "opencode-local",
-                    model = model,
-                    usage = TokenUsage(input = input, output = output, cacheRead = cacheRead),
-                    timestamp = date.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli(),
-                    sessionId = "demo",
-                ),
-            )
-        }
-    }
 }

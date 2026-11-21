@@ -1,8 +1,17 @@
 package pro.openminis.app.ext.group
 
+import pro.openminis.app.ext.opencode.api.TokenUsage
 import pro.openminis.app.ext.persona.Persona
 import pro.openminis.app.ext.persona.PersonaRepository
+import pro.openminis.app.ext.usage.UsageCenter
+import pro.openminis.app.ext.usage.UsageEvent
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -45,7 +54,7 @@ fun interface MemberEndpointResolver {
 }
 
 /**
- * 群聊引擎：把「一条用户消息」变成「若干成员依次发言」。
+ * 群聊引擎：把「一条用户消息」变成「若干成员同时发言」。
  *
  * ## 上下文可见性（这是群聊最容易做错的地方）
  *
@@ -57,7 +66,10 @@ fun interface MemberEndpointResolver {
  *  - 下一轮用户发言时，快照自然包含了 A、B 上一轮的最终答复；
  *  - 思考过程（thinking）只落盘给用户看，构建上下文时从不读取。
  *
- * 串行而不是并行：免费池对并发很敏感，且串行才能保证发言顺序稳定。
+ * ## 为什么可以并行
+ *
+ * 正因为每个成员只拿「发言前」的快照，成员之间在本轮互不依赖——上下文模型天然
+ * 兼容并行。多个成员同时流式输出，UI 按成员分段渲染，谁先出字谁先显示。
  */
 class GroupChatEngine(
     private val store: GroupStore,
@@ -152,106 +164,202 @@ class GroupChatEngine(
             }
         }
 
-        var spoken = 0
-        for (memberId in order) {
-            if (spoken >= MAX_SPEAKERS) break
-            val member = members.firstOrNull { it.id == memberId } ?: continue
-            val persona = personas.get(member.personaId)
-            val name = member.displayName.ifBlank { persona?.name ?: "成员" }
-
-            val endpoint = resolver.resolve(member)
-            if (endpoint == null) {
-                onEvent(
-                    GroupEvent.MemberFailed(
-                        member.id,
-                        name,
-                        if (member.source == GroupMemberDef.SOURCE_PROVIDER)
-                            "绑定的 API 不可用（凭据缺失或该类型暂不支持），到群设置里改一下"
-                        else "免费通道未启用（设置 › 免费 Token 通道）",
-                    ),
-                )
-                continue
+        // 并行发言：每个成员拿同一份快照、同时流式输出。见类注释「为什么可以并行」。
+        // 异常与取消的处理都在 speakOne 内收敛，这里只负责同时开火、一起等完。
+        coroutineScope {
+            order.take(MAX_SPEAKERS).map { memberId ->
+                launch {
+                    val member = members.firstOrNull { it.id == memberId } ?: return@launch
+                    speakOne(group, member, history, text, quote, onEvent)
+                }
             }
-
-            // 任务适配自检：只问一句「适合你吗」，不适合就不占用一轮发言
-            if (group.autoTaskFit && shouldSkip(endpoint, persona, name, text)) {
-                onEvent(GroupEvent.MemberSkipped(member.id, name, "判断这个任务不适合自己"))
-                store.appendMessage(
-                    GroupMessage(
-                        id = "msg_" + UUID.randomUUID().toString().take(8),
-                        groupId = groupId,
-                        role = "assistant",
-                        memberId = member.id,
-                        memberName = name,
-                        text = "（这个任务不适合我，本轮先不发言）",
-                        createdAt = System.currentTimeMillis(),
-                        skipped = true,
-                    ),
-                )
-                spoken += 1
-                continue
-            }
-
-            onEvent(GroupEvent.MemberStarted(member.id, name))
-            val reply = StringBuilder()
-            val thinking = StringBuilder()
-            var failure: Throwable? = null
-            try {
-                streamMember(
-                    endpoint = endpoint,
-                    persona = persona,
-                    member = member,
-                    memberName = name,
-                    history = history,
-                    userText = text,
-                    quote = quote,
-                    onDelta = { chunk ->
-                        reply.append(chunk)
-                        onEvent(GroupEvent.MemberDelta(member.id, chunk))
-                    },
-                    onThinking = { chunk ->
-                        thinking.append(chunk)
-                        onEvent(GroupEvent.MemberThinking(member.id, chunk))
-                    },
-                )
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                failure = e
-            }
-
-            if (failure != null) {
-                onEvent(GroupEvent.MemberFailed(member.id, name, failure.message ?: "调用失败"))
-                store.appendMessage(
-                    GroupMessage(
-                        id = "msg_" + UUID.randomUUID().toString().take(8),
-                        groupId = groupId,
-                        role = "assistant",
-                        memberId = member.id,
-                        memberName = name,
-                        text = "（调用失败：${failure.message}）",
-                        createdAt = System.currentTimeMillis(),
-                        failed = true,
-                    ),
-                )
-            } else {
-                val finalText = reply.toString().trim()
-                onEvent(GroupEvent.MemberFinished(member.id, name, finalText))
-                store.appendMessage(
-                    GroupMessage(
-                        id = "msg_" + UUID.randomUUID().toString().take(8),
-                        groupId = groupId,
-                        role = "assistant",
-                        memberId = member.id,
-                        memberName = name,
-                        text = finalText.ifBlank { "（本轮没有输出）" },
-                        createdAt = System.currentTimeMillis(),
-                        thinking = thinking.toString().trim().ifBlank { null },
-                    ),
-                )
-            }
-            spoken += 1
         }
+    }
+
+    /**
+     * 单个成员的完整一轮：解析端点 → 任务自检 → 流式调用 → 落盘。
+     *
+     * 被取消（用户点停止）时，已输出的半截文本也要落盘——用户明确要求
+     * 「打断时已说的话还在」。所以 catch 里用 [NonCancellable] 写文件再 rethrow。
+     */
+    private suspend fun speakOne(
+        group: GroupDef,
+        member: GroupMemberDef,
+        history: List<GroupMessage>,
+        userText: String,
+        quote: GroupMessage?,
+        onEvent: suspend (GroupEvent) -> Unit,
+    ) {
+        val persona = personas.get(member.personaId)
+        val name = member.displayName.ifBlank { persona?.name ?: "成员" }
+
+        val endpoint = resolver.resolve(member)
+        if (endpoint == null) {
+            onEvent(
+                GroupEvent.MemberFailed(
+                    member.id,
+                    name,
+                    if (member.source == GroupMemberDef.SOURCE_PROVIDER)
+                        "绑定的 API 不可用（凭据缺失或该类型暂不支持），到群设置里改一下"
+                    else "免费通道未启用（设置 › 免费 Token 通道）",
+                ),
+            )
+            return
+        }
+
+        // 任务适配自检：只问一句「适合你吗」，不适合就不占用一轮发言
+        if (group.autoTaskFit && shouldSkip(endpoint, persona, name, userText)) {
+            onEvent(GroupEvent.MemberSkipped(member.id, name, "判断这个任务不适合自己"))
+            store.appendMessage(
+                GroupMessage(
+                    id = "msg_" + UUID.randomUUID().toString().take(8),
+                    groupId = group.id,
+                    role = "assistant",
+                    memberId = member.id,
+                    memberName = name,
+                    text = "（这个任务不适合我，本轮先不发言）",
+                    createdAt = System.currentTimeMillis(),
+                    skipped = true,
+                ),
+            )
+            return
+        }
+
+        onEvent(GroupEvent.MemberStarted(member.id, name))
+        val reply = StringBuilder()
+        val thinking = StringBuilder()
+        var usage: TokenUsage? = null
+        var failure: Throwable? = null
+        try {
+            usage = streamMember(
+                endpoint = endpoint,
+                persona = persona,
+                member = member,
+                memberName = name,
+                history = history,
+                userText = userText,
+                quote = quote,
+                onDelta = { chunk ->
+                    reply.append(chunk)
+                    onEvent(GroupEvent.MemberDelta(member.id, chunk))
+                },
+                onThinking = { chunk ->
+                    thinking.append(chunk)
+                    onEvent(GroupEvent.MemberThinking(member.id, chunk))
+                },
+            )
+        } catch (e: CancellationException) {
+            // 打断：半截回复落盘（没字就不留空壳），再把取消抛回去让 UI 收尾
+            val partial = reply.toString().trim()
+            if (partial.isNotEmpty()) {
+                withContext(NonCancellable) {
+                    store.appendMessage(
+                        GroupMessage(
+                            id = "msg_" + UUID.randomUUID().toString().take(8),
+                            groupId = group.id,
+                            role = "assistant",
+                            memberId = member.id,
+                            memberName = name,
+                            text = partial,
+                            createdAt = System.currentTimeMillis(),
+                            interrupted = true,
+                        ),
+                    )
+                }
+            }
+            throw e
+        } catch (e: Exception) {
+            failure = e
+        }
+
+        if (failure != null) {
+            onEvent(GroupEvent.MemberFailed(member.id, name, failure.message ?: "调用失败"))
+            store.appendMessage(
+                GroupMessage(
+                    id = "msg_" + UUID.randomUUID().toString().take(8),
+                    groupId = group.id,
+                    role = "assistant",
+                    memberId = member.id,
+                    memberName = name,
+                    text = "（调用失败：${failure.message}）",
+                    createdAt = System.currentTimeMillis(),
+                    failed = true,
+                ),
+            )
+        } else {
+            val finalText = reply.toString().trim()
+            onEvent(GroupEvent.MemberFinished(member.id, name, finalText))
+            store.appendMessage(
+                GroupMessage(
+                    id = "msg_" + UUID.randomUUID().toString().take(8),
+                    groupId = group.id,
+                    role = "assistant",
+                    memberId = member.id,
+                    memberName = name,
+                    text = finalText.ifBlank { "（本轮没有输出）" },
+                    createdAt = System.currentTimeMillis(),
+                    thinking = thinking.toString().trim().ifBlank { null },
+                ),
+            )
+            // 绑定已存 API 的成员直连外部服务，bridge 看不到这些调用——
+            // 用量在这里记账。免费成员走 bridge，由 bridge 侧记录，避免双重入账。
+            if (usage != null && !usage.isEmpty && member.source == GroupMemberDef.SOURCE_PROVIDER) {
+                runCatching {
+                    UsageCenter.record(
+                        UsageEvent(
+                            provider = "api",
+                            model = endpoint.model,
+                            usage = usage,
+                            timestamp = System.currentTimeMillis(),
+                            sessionId = group.id,
+                            memberId = member.id,
+                            personaId = member.personaId,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 重试单个失败成员：不重发用户消息，只把这位成员按本轮上下文重新调用一遍。
+     *
+     * 本轮上下文 = 到最后一条用户消息（含）为止的历史快照——和其他成员看到的
+     * 完全一致，保证「这一轮大家都看同样的东西」这条规则不被重试打破。
+     */
+    suspend fun retryMember(
+        groupId: String,
+        memberId: String,
+        onEvent: suspend (GroupEvent) -> Unit,
+    ) = withContext(Dispatchers.IO) {
+        val group = store.group(groupId) ?: run {
+            onEvent(GroupEvent.Notice("群不存在"))
+            return@withContext
+        }
+        val member = store.members(groupId).firstOrNull { it.id == memberId } ?: run {
+            onEvent(GroupEvent.Notice("成员不存在，可能已被删除"))
+            return@withContext
+        }
+
+        val all = store.messages(groupId)
+        // 最后一条用户消息定义了「当前轮」；重试只覆盖本轮，不吃进本轮已落盘的回复
+        val lastUserIdx = all.indexOfLast { it.isUser }
+        if (lastUserIdx < 0) {
+            onEvent(GroupEvent.Notice("没有可以重试的用户消息"))
+            return@withContext
+        }
+        val userMessage = all[lastUserIdx]
+        val history = all.subList(0, lastUserIdx + 1)
+
+        // 引用只有 preview（120 字），重试用它还原最接近的引用形态
+        val quote = userMessage.quoteMemberId?.let { qid ->
+            all.firstOrNull { it.id == qid }
+        }
+        // 半截/失败的旧记录删掉，避免聊天里堆两条同一成员的失败消息
+        withContext(NonCancellable) {
+            store.removeLastFailedMessage(groupId, memberId)
+        }
+        speakOne(group, member, history, userMessage.text, quote, onEvent)
     }
 
     private fun nameOf(members: List<GroupMemberDef>, id: String): String =
@@ -351,7 +459,7 @@ class GroupChatEngine(
         quote: GroupMessage?,
         onDelta: suspend (String) -> Unit,
         onThinking: suspend (String) -> Unit,
-    ) {
+    ): TokenUsage? {
         val messages = historyMessages(history, member)
         val current = buildString {
             if (quote != null && quote.memberName != null) {
@@ -373,6 +481,8 @@ class GroupChatEngine(
             .put("model", endpoint.model)
             .put("stream", true)
             .put("temperature", 0.7)
+            // 兼容 OpenAI 标准端点：最后一块带 usage。不认识的端点会忽略它。
+            .put("stream_options", JSONObject().put("include_usage", true))
             .put("messages", full)
 
         val req = Request.Builder()
@@ -382,29 +492,50 @@ class GroupChatEngine(
             .header("Authorization", "Bearer ${endpoint.apiKey}")
             .build()
 
-        http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                val err = resp.body?.string()?.take(300).orEmpty()
-                throw IllegalStateException("HTTP ${resp.code} $err")
-            }
-            val source = resp.body?.source() ?: throw IllegalStateException("响应为空")
-            while (true) {
-                val line = source.readUtf8Line() ?: break
-                if (!line.startsWith("data:")) continue
-                val payload = line.removePrefix("data:").trim()
-                if (payload == "[DONE]") break
-                val obj = runCatching { JSONObject(payload) }.getOrNull() ?: continue
-                obj.optJSONObject("error")?.let {
-                    throw IllegalStateException(it.optString("message", "上游错误"))
+        // 用户点「停止」时协程被取消，但 readUtf8Line 是阻塞的 socket 读——
+        // 不主动断连的话读线程会一直挂到 readTimeout。协程一完成（含取消）
+        // 就 cancel 连接，阻塞读立刻抛 IOException 退出。
+        val call = http.newCall(req)
+        val job = currentCoroutineContext()[Job]
+        val onDone = job?.invokeOnCompletion { call.cancel() }
+        var usage: TokenUsage? = null
+        try {
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val err = resp.body?.string()?.take(300).orEmpty()
+                    throw IllegalStateException("HTTP ${resp.code} $err")
                 }
-                val choices = obj.optJSONArray("choices") ?: continue
-                val delta = choices.optJSONObject(0)?.optJSONObject("delta") ?: continue
-                val piece = delta.optString("content", "")
-                if (piece.isNotEmpty()) onDelta(piece)
-                val reason = delta.optString("reasoning_content", "")
-                if (reason.isNotEmpty()) onThinking(reason)
+                val source = resp.body?.source() ?: throw IllegalStateException("响应为空")
+                while (true) {
+                    val line = source.readUtf8Line() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val payload = line.removePrefix("data:").trim()
+                    if (payload == "[DONE]") break
+                    val obj = runCatching { JSONObject(payload) }.getOrNull() ?: continue
+                    obj.optJSONObject("error")?.let {
+                        throw IllegalStateException(it.optString("message", "上游错误"))
+                    }
+                    // include_usage 的最后一块：choices 为空、usage 有值
+                    obj.optJSONObject("usage")?.let { u ->
+                        usage = TokenUsage(
+                            input = u.optLong("prompt_tokens"),
+                            output = u.optLong("completion_tokens"),
+                            cacheRead = u.optJSONObject("prompt_tokens_details")?.optLong("cached_tokens") ?: 0L,
+                        )
+                    }
+                    val choices = obj.optJSONArray("choices") ?: continue
+                    val delta = choices.optJSONObject(0)?.optJSONObject("delta") ?: continue
+                    val piece = delta.optString("content", "")
+                    if (piece.isNotEmpty()) onDelta(piece)
+                    val reason = delta.optString("reasoning_content", "")
+                    if (reason.isNotEmpty()) onThinking(reason)
+                }
             }
+        } finally {
+            onDone?.dispose()
+            call.cancel()
         }
+        return usage
     }
 
     companion object {

@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -29,7 +30,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -150,13 +153,46 @@ fun GroupChatScreen(
     var quote by remember { mutableStateOf<GroupMessage?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var newGroupName by remember { mutableStateOf("") }
+    // 当前一轮发言的任务句柄：保存它才能支持「输出中打断」
+    var currentJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    // send 与重试共用同一套事件处理：成员消息进流式气泡，失败写状态条
+    val handleEvent: suspend (GroupEvent) -> Unit = { ev ->
+        kotlinx.coroutines.withContext(Dispatchers.Main) {
+            when (ev) {
+                is GroupEvent.MemberStarted ->
+                    pending = pending + (ev.memberId to "")
+                is GroupEvent.MemberDelta ->
+                    pending = pending + (
+                        ev.memberId to ((pending[ev.memberId] ?: "") + ev.text)
+                        )
+                is GroupEvent.MemberThinking ->
+                    thinking = thinking + (
+                        ev.memberId to ((thinking[ev.memberId] ?: "") + ev.text)
+                        )
+                is GroupEvent.MemberFinished ->
+                    pending = pending - ev.memberId
+                is GroupEvent.MemberSkipped -> {
+                    pending = pending - ev.memberId
+                    status = "${ev.name} 跳过了这轮：${ev.reason}"
+                }
+                is GroupEvent.MemberFailed -> {
+                    pending = pending - ev.memberId
+                    status = "${ev.name} 调用失败：${ev.reason}"
+                }
+                is GroupEvent.Notice -> status = ev.text
+            }
+        }
+    }
 
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
-    LaunchedEffect(messages.size, pending.size) {
+    // 自动跟随只在用户本来就在底部时生效：输出过程中往上翻看历史，不会被强行拽回底部
+    LaunchedEffect(messages.size, pending.size, pending.values.sumOf { it.length }) {
         val total = messages.size + pending.size
-        if (total > 0) runCatching { listState.animateScrollToItem(total - 1) }
+        if (total > 0 && !listState.canScrollForward) {
+            runCatching { listState.animateScrollToItem(total - 1) }
+        }
     }
 
     if (group == null) {
@@ -180,8 +216,11 @@ fun GroupChatScreen(
         topBar = {
             TopAppBar(
                 navigationIcon = {
-                    IconButton(onClick = { currentId = null; version++ }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回群列表")
+                    // 返回 = 直接回上一页（主页）。以前先回到群列表，用户要按两次
+                    // 才能退出——从主页进来的人只想一键回到主页。群列表仍可从
+                    // 长按新对话按钮的入口进入。
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                     }
                 },
                 title = {
@@ -229,9 +268,28 @@ fun GroupChatScreen(
                     if (m.isUser) {
                         UserBubble(m)
                     } else {
+                        val retryGroupId = group.id
                         MemberBubble(
                             message = m,
                             member = members.firstOrNull { it.id == m.memberId },
+                            onRetry = if (m.failed && m.memberId != null && !busy) ({
+                                {
+                                    status = ""
+                                    busy = true
+                                    currentJob = scope.launch {
+                                        try {
+                                            engine.retryMember(retryGroupId, m.memberId!!, handleEvent)
+                                        } finally {
+                                            withContext(Dispatchers.Main) {
+                                                busy = false
+                                                pending = emptyMap()
+                                                thinking = emptyMap()
+                                                version++
+                                            }
+                                        }
+                                    }
+                                }
+                            }) else null,
                         )
                     }
                 }
@@ -268,6 +326,7 @@ fun GroupChatScreen(
                 bridgeReady = manager.bridgeBaseUrl != null || members.any {
                     it.source == GroupMemberDef.SOURCE_PROVIDER
                 },
+                onStop = { currentJob?.cancel() },
                 onSend = {
                     val text = input.trim()
                     if (text.isNotEmpty() && !busy) {
@@ -279,35 +338,9 @@ fun GroupChatScreen(
                         val q = quote
                         quote = null
                         val gid = sendGroupId
-                        scope.launch {
+                        currentJob = scope.launch {
                             try {
-                                engine.send(gid, text, q) { ev ->
-                                    withContext(Dispatchers.Main) {
-                                        when (ev) {
-                                            is GroupEvent.MemberStarted ->
-                                                pending = pending + (ev.memberId to "")
-                                            is GroupEvent.MemberDelta ->
-                                                pending = pending + (
-                                                    ev.memberId to ((pending[ev.memberId] ?: "") + ev.text)
-                                                    )
-                                            is GroupEvent.MemberThinking ->
-                                                thinking = thinking + (
-                                                    ev.memberId to ((thinking[ev.memberId] ?: "") + ev.text)
-                                                    )
-                                            is GroupEvent.MemberFinished ->
-                                                pending = pending - ev.memberId
-                                            is GroupEvent.MemberSkipped -> {
-                                                pending = pending - ev.memberId
-                                                status = "${ev.name} 跳过了这轮：${ev.reason}"
-                                            }
-                                            is GroupEvent.MemberFailed -> {
-                                                pending = pending - ev.memberId
-                                                status = "${ev.name} 调用失败：${ev.reason}"
-                                            }
-                                            is GroupEvent.Notice -> status = ev.text
-                                        }
-                                    }
-                                }
+                                engine.send(gid, text, q, handleEvent)
                             } finally {
                                 withContext(Dispatchers.Main) {
                                     busy = false
@@ -447,7 +480,11 @@ private fun UserBubble(message: GroupMessage) {
 }
 
 @Composable
-private fun MemberBubble(message: GroupMessage, member: GroupMemberDef?) {
+private fun MemberBubble(
+    message: GroupMessage,
+    member: GroupMemberDef?,
+    onRetry: (() -> Unit)? = null,
+) {
     val spec = member?.let { AiAvatars.resolve(it) }
         ?: AvatarSpec(
             message.memberName?.let { AiAvatars.initialOf(it) } ?: "AI",
@@ -476,6 +513,13 @@ private fun MemberBubble(message: GroupMessage, member: GroupMemberDef?) {
                         color = GC_ORANGE,
                     )
                 }
+                if (message.interrupted) {
+                    Text(
+                        text = " · 已停止",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             if (!message.thinking.isNullOrBlank()) {
                 ThinkingBlock(message.thinking)
@@ -491,6 +535,19 @@ private fun MemberBubble(message: GroupMessage, member: GroupMemberDef?) {
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (message.failed) GC_RED else MaterialTheme.colorScheme.onSurface,
                 )
+            }
+            // 失败的消息带重试：不重发用户消息，只重新调用这位成员
+            if (message.failed && onRetry != null) {
+                TextButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Icon(
+                        Icons.Filled.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text("重试", style = MaterialTheme.typography.labelMedium)
+                }
             }
         }
     }
@@ -564,6 +621,7 @@ private fun Composer(
     onClearQuote: () -> Unit,
     busy: Boolean,
     bridgeReady: Boolean,
+    onStop: () -> Unit,
     onSend: () -> Unit,
 ) {
     Surface(
@@ -600,20 +658,33 @@ private fun Composer(
                     shape = RoundedCornerShape(20.dp),
                 )
                 Spacer(Modifier.width(8.dp))
-                IconButton(
-                    onClick = onSend,
-                    enabled = !busy && value.isNotBlank(),
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(CircleShape)
-                        .background(if (busy || value.isBlank()) Color(0xFFB0B0B5) else GC_BLUE),
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送", tint = Color.White)
+                if (busy) {
+                    // 输出中：发送键换成停止键。打断后已输出的半截回复会保留在聊天里。
+                    IconButton(
+                        onClick = onStop,
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(GC_RED),
+                    ) {
+                        Icon(Icons.Filled.Stop, contentDescription = "停止", tint = Color.White)
+                    }
+                } else {
+                    IconButton(
+                        onClick = onSend,
+                        enabled = value.isNotBlank(),
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(if (value.isBlank()) Color(0xFFB0B0B5) else GC_BLUE),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送", tint = Color.White)
+                    }
                 }
             }
             if (busy) {
                 Text(
-                    text = "成员发言中…",
+                    text = "成员同时发言中…（点 ■ 可打断，已输出的内容会保留）",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp),

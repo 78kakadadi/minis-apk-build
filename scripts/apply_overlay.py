@@ -194,7 +194,13 @@ def main() -> None:
         "                onFreeTokenClick = { navController.safeNavigate(Routes.FREE_TOKEN) },\n"
         "                onHeatmapClick = { navController.safeNavigate(Routes.HEATMAP) },\n"
         "                onKeyPoolClick = { navController.safeNavigate(Routes.KEY_POOL) },\n"
-        "                onGroupChatClick = { navController.safeNavigate(Routes.GROUP_CHAT) },\n"
+        "                onGroupChatClick = { groupId ->\n"
+        "                    // 主页点群聊卡片必须直达聊天界面：以前一律走不带 id 的\n"
+        "                    // GROUP_CHAT，先落到群列表，得多点一次才能进群——\n"
+        "                    // 返回时也要多退一页。带 id 走 GROUP_CHAT_ONE 直达。\n"
+        "                    if (groupId == null) navController.safeNavigate(Routes.GROUP_CHAT)\n"
+        "                    else navController.safeNavigate(Routes.groupChatWith(groupId))\n"
+        "                },\n"
         "                onPluginClick = { navController.safeNavigate(Routes.PLUGINS) },\n"
         "                onDispatchClick = { navController.safeNavigate(Routes.DISPATCH) },\n",
         "扩展能力导航回调",
@@ -371,7 +377,21 @@ def main() -> None:
         "// 群聊入口：长按新对话按钮 → 群聊",
     )
 
-    # 20) 长按不再受「有没有模型组」限制：没有模型组也应该能建群
+    # 19b) DualFabRow 函数体开头：拿 context 给长按建群用
+    patch(
+        sessions,
+        "    // 群聊入口：长按新对话按钮 → 群聊\n"
+        "    onGroupChatClick: (String?) -> Unit,\n"
+        ") {",
+        "    // 群聊入口：长按新对话按钮 → 群聊\n"
+        "    onGroupChatClick: (String?) -> Unit,\n"
+        ") {\n"
+        "    val gcContext = androidx.compose.ui.platform.LocalContext.current",
+        "DualFabRow 群聊 context",
+        "val gcContext = androidx.compose.ui.platform.LocalContext.current",
+    )
+
+    # 20) 长按新对话按钮 = 直接创建群聊并进入
     patch(
         sessions,
         "                    .combinedClickable(\n"
@@ -382,10 +402,18 @@ def main() -> None:
         "                    ),",
         "                    .combinedClickable(\n"
         "                        onClick = onNewChat,\n"
-        "                        onLongClick = { showGroupMenu = true },\n"
+        "                        // 长按 = 直接创建群聊（默认名「新群聊」）并进入聊天界面，\n"
+        "                        // 界面里的空成员引导会带用户去加成员。以前是弹一个\n"
+        "                        // 底部弹层还要再点一次「创建」，用户感知是「长按没用」。\n"
+        "                        onLongClick = {\n"
+        "                            onGroupChatClick(\n"
+        "                                pro.openminis.app.ext.group.GroupStore(gcContext).createGroup(\"\").id,\n"
+        "                            )\n"
+        "                        },\n"
         "                    ),",
-        "长按手势无条件生效",
-        "onLongClick = { showGroupMenu = true },",
+        "长按直接建群",
+        "onLongClick = {\n"
+        "                            onGroupChatClick(",
     )
 
     # 21) 下拉菜单 → 群聊弹层
