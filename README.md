@@ -18,12 +18,43 @@ GitHub Actions 的 `ubuntu-latest` 自带 Android 工具链生态，正好补上
 
 ```
 .github/workflows/build.yml   # 完整构建流水线
+scripts/rename_package.py     # 包名迁移（com.openminis.app → pro.openminis.app）
+scripts/apply_overlay.py      # 对上游已有的文件做定点插入（幂等）
 overlay/                      # 增量模块，按 app 模块的源码根布局放置
-  main/kotlin/...             # → src/android/app/src/main/kotlin/...
-  main/java/...               # → src/android/app/src/main/java/...
+  java/pro/openminis/app/...  # → src/android/app/src/main/java/pro/openminis/app/...
 ```
 
-`overlay/` 为空时构建的就是**原版 Minis**——这是第一步要验证的基线。
+`overlay/` 为空时构建的就是**原版 Minis**（包名仍是上游的 `com.openminis.app`）——这是第一步要验证的基线。
+
+## 包名
+
+产物包名固定为 **`pro.openminis.app`**，与原版可共存安装。
+
+`com.openminis.app` 在工程里出现的位置不止 `namespace`/`applicationId`，
+所以用 `scripts/rename_package.py` 一次性处理四类改动：
+
+| 类别 | 例子 | 漏改后果 |
+|---|---|---|
+| 源码目录 + package 声明 | `java/com/openminis/app` → `java/pro/openminis/app` | 编译失败（namespace 与源集不匹配） |
+| 文本中的包名 | `BuildConfig`/`R` 引用、`Class.forName`、intent action、ACRA 的 `META-INF/services`、`shortcuts.xml` 的 `targetPackage` | 运行期 `ClassNotFoundException` / 快捷方式失效 / 崩溃上报不上报 |
+| gradle | `namespace`、`applicationId` | APK 包名不变 |
+| JNI 符号 | `Java_com_openminis_app_sandbox_PtyBridge_forkExec` | **装得上，一用就崩**：`UnsatisfiedLinkError`（终端、分词、崩溃捕获都走 native） |
+
+刻意**不改** `com.openminis.rclone`：那是 gomobile 从 Go 生成的绑定包，
+包名由 native 侧固定，改了之后 rclone/备份首次调用就会 `UnsatisfiedLinkError`。
+
+因为 `applicationId` 变了，这是**另一个应用**：旧版的会话、设置、沙箱 rootfs
+都在 `com.openminis.app` 的数据目录下，新包读不到，需要重新配置；
+两个包可以同时装在手机上，互不干扰。
+
+构建后校验（CI 里已固化为断言，失败即红）：
+
+```bash
+grep -q 'applicationId = "pro.openminis.app"' app/build.gradle.kts
+grep -q 'Java_pro_openminis_app_' app/src/main/cpp/pty_bridge.c
+test -f app/src/main/java/pro/openminis/app/MainActivity.kt
+```
+
 
 ## 触发
 

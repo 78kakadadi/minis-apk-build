@@ -9,7 +9,7 @@
 import sys
 import pathlib
 
-ROOT = pathlib.Path("src/android/app/src/main/java/com/openminis/app")
+ROOT = pathlib.Path("src/android/app/src/main/java/pro/openminis/app")
 GRADLE = pathlib.Path("src/android/app/build.gradle.kts")
 
 
@@ -100,7 +100,7 @@ def main() -> None:
         nav,
         "        composable(Routes.BACKUP) { entry ->",
         "        composable(Routes.FREE_TOKEN) {\n"
-        "            com.openminis.app.ui.settings.FreeTokenSettingsScreen(\n"
+        "            pro.openminis.app.ui.settings.FreeTokenSettingsScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
@@ -206,27 +206,27 @@ def main() -> None:
         nav,
         "        composable(Routes.BACKUP) { entry ->",
         "        composable(Routes.HEATMAP) {\n"
-        "            com.openminis.app.ui.opencode.TokenHeatmapScreen(\n"
+        "            pro.openminis.app.ui.opencode.TokenHeatmapScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
         "        composable(Routes.KEY_POOL) {\n"
-        "            com.openminis.app.ui.opencode.ApiKeyPoolScreen(\n"
+        "            pro.openminis.app.ui.opencode.ApiKeyPoolScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
         "        composable(Routes.GROUP_CHAT) {\n"
-        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "            pro.openminis.app.ui.opencode.GroupChatScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
         "        composable(Routes.PLUGINS) {\n"
-        "            com.openminis.app.ui.opencode.PluginScreen(\n"
+        "            pro.openminis.app.ui.opencode.PluginScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
         "        composable(Routes.DISPATCH) {\n"
-        "            com.openminis.app.ui.opencode.DispatchScreen(\n"
+        "            pro.openminis.app.ui.opencode.DispatchScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
@@ -310,7 +310,7 @@ def main() -> None:
         nav,
         "        composable(Routes.BACKUP) { entry ->",
         "        composable(Routes.PERSONAS) {\n"
-        "            com.openminis.app.ui.opencode.PersonaScreen(\n"
+        "            pro.openminis.app.ui.opencode.PersonaScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n\n"
@@ -406,7 +406,7 @@ def main() -> None:
         "                    )\n"
         "                }\n"
         "            }",
-        "            com.openminis.app.ui.opencode.GroupChatFabMenu(\n"
+        "            pro.openminis.app.ui.opencode.GroupChatFabMenu(\n"
         "                expanded = showGroupMenu,\n"
         "                onDismiss = { showGroupMenu = false },\n"
         "                onOpen = { groupId ->\n"
@@ -415,7 +415,7 @@ def main() -> None:
         "                },\n"
         "            )",
         "长按弹层改为群聊",
-        "com.openminis.app.ui.opencode.GroupChatFabMenu(",
+        "pro.openminis.app.ui.opencode.GroupChatFabMenu(",
     )
 
     # 22) 在按钮行上方插入一次性提示条（Column 包裹）
@@ -431,7 +431,7 @@ def main() -> None:
         "            .padding(horizontal = 16.dp, vertical = 20.dp),",
         "    Column(modifier = modifier) {\n"
         "    // 首次进入时的「长按建群」提示，只出现一次\n"
-        "    com.openminis.app.ui.opencode.GroupChatFabHint()\n"
+        "    pro.openminis.app.ui.opencode.GroupChatFabHint()\n"
         "    Row(\n"
         "        modifier = Modifier\n"
         "            .fillMaxWidth()\n"
@@ -441,7 +441,7 @@ def main() -> None:
         "            .imePadding()\n"
         "            .padding(horizontal = 16.dp, vertical = 20.dp),",
         "提示条插入",
-        "com.openminis.app.ui.opencode.GroupChatFabHint()",
+        "pro.openminis.app.ui.opencode.GroupChatFabHint()",
     )
 
     # 23) 关闭上面新开的 Column
@@ -492,12 +492,12 @@ def main() -> None:
     patch(
         nav,
         "        composable(Routes.GROUP_CHAT) {\n"
-        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "            pro.openminis.app.ui.opencode.GroupChatScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }",
         "        composable(Routes.GROUP_CHAT) {\n"
-        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "            pro.openminis.app.ui.opencode.GroupChatScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "            )\n"
         "        }\n"
@@ -506,7 +506,7 @@ def main() -> None:
         "            route = Routes.GROUP_CHAT_ONE,\n"
         "            arguments = listOf(navArgument(\"groupId\") { type = NavType.StringType }),\n"
         "        ) { entry ->\n"
-        "            com.openminis.app.ui.opencode.GroupChatScreen(\n"
+        "            pro.openminis.app.ui.opencode.GroupChatScreen(\n"
         "                onBack = { navController.safePopBackStack() },\n"
         "                initialGroupId = entry.arguments?.getString(\"groupId\"),\n"
         "            )\n"
@@ -521,7 +521,7 @@ def main() -> None:
         "        2 -> ModelSelectionStep(providerRepository = providerRepository, onComplete = onComplete)",
         "        2 -> ModelSelectionStep(providerRepository = providerRepository, onComplete = { step = 3 })\n"
         "        // 长按新对话按钮 → 群聊，作为引导的最后一页\n"
-        "        3 -> com.openminis.app.ui.opencode.OnboardingGroupChatStep(onComplete = onComplete)",
+        "        3 -> pro.openminis.app.ui.opencode.OnboardingGroupChatStep(onComplete = onComplete)",
         "引导页新增群聊步骤",
         "OnboardingGroupChatStep(onComplete = onComplete)",
     )
@@ -541,7 +541,7 @@ def main() -> None:
         "            if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {\n",
         "            if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {\n"
         "                // 群聊模块：放在会话列表顶部，顺带在主页拉起免费通道\n"
-        "                com.openminis.app.ui.opencode.GroupChatHomeSection(\n"
+        "                pro.openminis.app.ui.opencode.GroupChatHomeSection(\n"
         "                    onOpen = { gid -> onGroupChatClick(gid) },\n"
         "                    onCreate = { onGroupChatClick(null) },\n"
         "                )\n",
@@ -554,7 +554,7 @@ def main() -> None:
         sessions,
         "                if (sessions.isEmpty() && !(searchResultsActive && folderBlocks.isNotEmpty())) {",
         "                if (sessions.isEmpty() &&\n"
-        "                    !com.openminis.app.ui.opencode.hasGroupChats(context) &&\n"
+        "                    !pro.openminis.app.ui.opencode.hasGroupChats(context) &&\n"
         "                    !(searchResultsActive && folderBlocks.isNotEmpty())\n"
         "                ) {",
         "空状态让位给群聊",
@@ -566,7 +566,7 @@ def main() -> None:
         sessions,
         "            } else if (hasProviders && (sessions.isNotEmpty() || isSearchActive)) {",
         "            } else if (hasProviders && (sessions.isNotEmpty() || isSearchActive ||\n"
-        "                com.openminis.app.ui.opencode.hasGroupChats(context))\n"
+        "                pro.openminis.app.ui.opencode.hasGroupChats(context))\n"
         "            ) {",
         "底部按钮常驻",
         "hasGroupChats(context))\n            ) {",
