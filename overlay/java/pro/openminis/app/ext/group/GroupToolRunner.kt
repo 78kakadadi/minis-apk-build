@@ -113,14 +113,14 @@ class GroupToolRunner(
         val regex = globToRegex(pattern)
         val root = workspace.canonicalFile
         val hits = ArrayList<String>()
-        root.walkTopDown()
-            .onEnter { it.name != ".git" && it.name != "node_modules" }
-            .forEach { f ->
-                if (f != root && regex.matches(rel(f))) {
-                    hits.add(rel(f) + if (f.isDirectory) "/" else "")
-                }
-                if (hits.size >= MAX_LIST) return@forEach
+        // 用 for + break 而不是 forEach + return@forEach：后者只跳过当前元素，
+        // 工作区里真有几千个文件时会白遍历一遍。
+        for (f in root.walkTopDown().onEnter { it.name != ".git" && it.name != "node_modules" }) {
+            if (f != root && regex.matches(rel(f))) {
+                hits.add(rel(f) + if (f.isDirectory) "/" else "")
             }
+            if (hits.size >= MAX_LIST) break
+        }
         if (hits.isEmpty()) return Result("没有匹配「$pattern」的文件")
         return Result(hits.take(MAX_LIST).joinToString("\n"))
     }

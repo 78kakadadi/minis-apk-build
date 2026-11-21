@@ -617,14 +617,36 @@ class GroupChatEngine(
         var total: TokenUsage? = null
 
         for (round in 0 until MAX_TOOL_ROUNDS) {
-            val res = streamOnce(
-                endpoint = endpoint,
-                messages = messages,
-                tools = declarations.takeIf { it.length() > 0 },
-                freeToolRule = null,
-                onDelta = onDelta,
-                onThinking = onThinking,
-            )
+            val res = try {
+                streamOnce(
+                    endpoint = endpoint,
+                    messages = messages,
+                    tools = declarations.takeIf { it.length() > 0 },
+                    freeToolRule = null,
+                    onDelta = onDelta,
+                    onThinking = onThinking,
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 兼容性兜底：不少「OpenAI 兼容」模型其实不支持 function calling，
+                // 带 tools 直接 400。旧群成员升级后默认全开工具，如果不降级，
+                // 原本能聊的群会突然整条失败——这比「工具没生效」严重得多。
+                // 只在第一轮（还没有任何工具结果回填）降级，避免把真实错误吞掉。
+                if (round == 0 && declarations.length() > 0 && isToolsUnsupported(e)) {
+                    onTool("\n\n（这个模型不支持工具调用，本轮已按普通对话重试）\n\n")
+                    streamOnce(
+                        endpoint = endpoint,
+                        messages = messages,
+                        tools = null,
+                        freeToolRule = null,
+                        onDelta = onDelta,
+                        onThinking = onThinking,
+                    )
+                } else {
+                    throw e
+                }
+            }
             total = when {
                 res.usage == null -> total
                 total == null -> res.usage
@@ -672,6 +694,20 @@ class GroupChatEngine(
             }
         }
         return total
+    }
+
+    /**
+     * 这次失败是不是「端点不认 tools」。
+     *
+     * 只认 400/422：这是 OpenAI 兼容端点对「不认识请求体字段」的典型回应。
+     * 401（key 错）、429（限流）、5xx 都不降级——降级重试只会再撞一次同样的墙，
+     * 还把真正的错误信息盖掉。
+     */
+    private fun isToolsUnsupported(e: Exception): Boolean {
+        val code = Regex("HTTP (\\d{3})")
+            .find(e.message.orEmpty())
+            ?.groupValues?.get(1)?.toIntOrNull()
+        return code == 400 || code == 422
     }
 
     /** 一次流式请求（不含工具循环）。tool_calls 按 index 累积成完整调用。 */
