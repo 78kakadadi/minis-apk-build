@@ -187,7 +187,7 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = "OpenCode 账号",
+                    text = "登录 OpenCode 账号",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
@@ -258,8 +258,9 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                 Spacer(Modifier.height(2.dp))
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
+                    modifier = Modifier.fillMaxWidth(),
                     onClick = {
                         busy = "device"
                         notice = null
@@ -281,6 +282,7 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                 ) { Text(if (busy == "device") "启动中…" else "登录 OpenCode 账号") }
 
                 OutlinedButton(
+                    modifier = Modifier.fillMaxWidth(),
                     onClick = {
                         notice = null
                         scope.launch {

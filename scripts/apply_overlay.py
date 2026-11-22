@@ -68,6 +68,14 @@ def main() -> None:
         '                    title = "免费 Token 通道",\n'
         '                    subtitle = "内嵌 OpenCode，可登录账号或免 Key 使用",\n'
         "                    onClick = onFreeTokenClick,\n"
+        "                    showDivider = true,\n"
+        "                )\n"
+        "                SettingsItem(\n"
+        "                    icon = Icons.Outlined.Person,\n"
+        "                    iconColor = Color(0xFF4C8DFF),\n"
+        '                    title = "OpenCode 账号登录",\n'
+        '                    subtitle = "登录后用自己的额度，也可粘贴 API Key",\n'
+        "                    onClick = onOpencodeAccountClick,\n"
         "                    showDivider = false,\n"
         "                )\n"
         "            }",
@@ -593,6 +601,57 @@ def main() -> None:
         "        pro.openminis.app.ext.keypool.KeyPoolRegistry.init(this)\n",
         "号池冷启动",
         "ext.keypool.KeyPoolRegistry.init(this)",
+    )
+
+    # 32) OpenCode 账号登录：设置首页独立入口
+    #     登录按钮原先只长在「免费 Token 通道」页里，从标题看不出跟账号有关，
+    #     用户不会点进去找。这里给一行独立入口。
+    patch(
+        settings,
+        "import androidx.compose.material.icons.outlined.BarChart\n",
+        "import androidx.compose.material.icons.outlined.BarChart\n"
+        "import androidx.compose.material.icons.outlined.Person\n",
+        "账号入口图标",
+        "icons.outlined.Person",
+    )
+
+    patch(
+        settings,
+        "    onFreeTokenClick: () -> Unit = {},\n",
+        "    onFreeTokenClick: () -> Unit = {},\n"
+        "    onOpencodeAccountClick: () -> Unit = {},\n",
+        "账号入口参数",
+        "onOpencodeAccountClick: () -> Unit",
+    )
+
+    patch(
+        nav,
+        '    const val FREE_TOKEN = "free_token"',
+        '    const val FREE_TOKEN = "free_token"\n    const val OPENCODE_ACCOUNT = "opencode_account"',
+        "账号页路由",
+        'const val OPENCODE_ACCOUNT = "opencode_account"',
+    )
+
+    patch(
+        nav,
+        "                onFreeTokenClick = { navController.safeNavigate(Routes.FREE_TOKEN) },\n",
+        "                onFreeTokenClick = { navController.safeNavigate(Routes.FREE_TOKEN) },\n"
+        "                onOpencodeAccountClick = { navController.safeNavigate(Routes.OPENCODE_ACCOUNT) },\n",
+        "账号页导航回调",
+        "Routes.OPENCODE_ACCOUNT) },",
+    )
+
+    patch(
+        nav,
+        "        composable(Routes.FREE_TOKEN) {\n",
+        "        composable(Routes.OPENCODE_ACCOUNT) {\n"
+        "            pro.openminis.app.ui.settings.OpencodeAccountScreen(\n"
+        "                onBack = { navController.safePopBackStack() },\n"
+        "            )\n"
+        "        }\n\n"
+        "        composable(Routes.FREE_TOKEN) {\n",
+        "账号页注册",
+        "OpencodeAccountScreen(",
     )
 
     print("注入完成。")
