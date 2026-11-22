@@ -3,8 +3,6 @@ package pro.openminis.app.ui.settings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -138,8 +136,10 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                 device = null
                 val active = saved.firstOrNull { it.active }
                 if (active != null) {
-                    notice = "已登录：${active.label}。正在按账号刷新模型清单；若仍提示未登录，点上方「重启服务」。"
-                    manager.refreshModels()
+                    notice = "已登录：${active.label}。正在按账号重启运行时并重新注册模型…"
+                    // 凭据在运行时启动时才组装进 provider，光刷新清单不够；
+                    // 重启后还会重新走模型发现与 provider 注册，选择器里才会真的变。
+                    manager.restart()
                 } else {
                     notice = "授权没有完成（状态：$state），可以再试一次或改用 API Key 登录。"
                 }
@@ -219,8 +219,8 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                                     }
                                     busy = null
                                     r.onSuccess {
-                                        notice = "已切换到：${acc.label}，正在刷新模型清单…"
-                                        manager.refreshModels()
+                                        notice = "已切换到：${acc.label}，正在按账号重启运行时…"
+                                        manager.restart()
                                     }.onFailure {
                                         notice = "切换失败：${it.message}"
                                     }
@@ -302,9 +302,10 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                     }
                     busy = null
                     r.onSuccess { warning ->
-                        notice = warning ?: "已登录。正在按账号刷新模型清单；若仍提示未登录，点上方「重启服务」。"
-                        manager.refreshModels()
+                        notice = warning ?: "已登录。正在按账号重启运行时并重新注册模型…"
+                        // 先把账号列表读出来（此时服务还在），再重启
                         reload()
+                        manager.restart()
                     }.onFailure {
                         notice = "登录失败：${it.message}"
                     }
@@ -332,10 +333,10 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                             runCatching { manager.account.logout(target.id) }
                         }
                         busy = null
-                        r.onSuccess { notice = "已退出：${target.label}" }
+                        r.onSuccess { notice = "已退出：${target.label}，正在重启运行时…" }
                             .onFailure { notice = "退出失败：${it.message}" }
-                        manager.refreshModels()
                         reload()
+                        manager.restart()
                     }
                 }) { Text("退出登录", color = ACC_ERR) }
             },
@@ -499,14 +500,6 @@ private fun KeyLoginDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
-}
-
-private fun openUrl(context: Context, url: String) {
-    runCatching {
-        context.startActivity(
-            Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
-    }
 }
 
 private fun copyText(context: Context, text: String, label: String) {
