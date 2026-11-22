@@ -7,6 +7,7 @@ import pro.openminis.app.data.model.ModelGroup
 import pro.openminis.app.data.model.ProviderCredential
 import pro.openminis.app.data.model.ProviderInstance
 import pro.openminis.app.data.model.ProviderType
+import pro.openminis.app.data.model.ThinkingLevel
 import pro.openminis.app.data.repository.ProviderRepository
 import pro.openminis.app.ext.opencode.api.OpencodeServerClient
 import pro.openminis.app.ext.opencode.api.ServerHttpException
@@ -403,9 +404,10 @@ class FreeTokenManager private constructor(context: Context) {
             }
         }
 
-        val have = repo.entriesFor(id).map { it.baseModel.id }.toHashSet()
+        val existingEntries = repo.entriesFor(id).associateBy { it.baseModel.id }
         _models.value.forEach { m ->
-            if (m.id !in have) {
+            val entry = existingEntries[m.id]
+            if (entry == null) {
                 repo.addEntry(
                     ModelEntry(
                         providerInstanceId = id,
@@ -413,9 +415,19 @@ class FreeTokenManager private constructor(context: Context) {
                             id = m.id,
                             displayName = m.label,
                             provider = "opencode",
+                            // 免费池的模型会把思考过程通过 reasoning_content 流回来。
+                            // 不声明这一位，聊天页的「思考强度」会判定为不支持、点了
+                            // 没反应，消息的 thinkingLevel 永远是 OFF，ChatScreen 就把
+                            // 思考行整行隐藏——表现就是「思考过程不显示」。
+                            supportsReasoning = true,
                         ),
                         isCustom = true,
                     ),
+                )
+            } else if (entry.baseModel.supportsReasoning != true) {
+                // 老版本注册过的 entry 也要补上，否则升级后仍然看不到思考
+                repo.updateEntry(
+                    entry.copy(baseModel = entry.baseModel.copy(supportsReasoning = true)),
                 )
             }
         }
@@ -437,10 +449,23 @@ class FreeTokenManager private constructor(context: Context) {
         val name = GROUP_NAME
         val existing = repo.config.value.modelGroups.firstOrNull { it.name == name }
         val groupId = if (existing == null) {
-            repo.addGroup(ModelGroup(name = name, memberEntryIds = entryIds.toMutableList()))
+            repo.addGroup(
+                ModelGroup(
+                    name = name,
+                    memberEntryIds = entryIds.toMutableList(),
+                    // 免费模型本身就会思考，默认给 MEDIUM：用户不用先去顶部把
+                    // 思考强度调一遍，才能看到思考过程。
+                    defaultThinkingLevel = ThinkingLevel.MEDIUM,
+                ),
+            )
             repo.config.value.modelGroups.firstOrNull { it.name == name }?.id
         } else {
-            repo.updateGroup(existing.copy(memberEntryIds = entryIds.toMutableList()))
+            val merged = existing.copy(
+                memberEntryIds = entryIds.toMutableList(),
+                // 只在用户没显式选过时补默认值，别覆盖他主动关掉思考的选择
+                defaultThinkingLevel = existing.defaultThinkingLevel ?: ThinkingLevel.MEDIUM,
+            )
+            if (merged != existing) repo.updateGroup(merged)
             existing.id
         }
 
