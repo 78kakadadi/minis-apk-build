@@ -314,8 +314,16 @@ class OpenAiBridgeServer(
         }
         // 逐个都撞了 plan 限制：这不是网络问题，别让用户对着一句 403 猜
         if (!succeeded && allUnavailable && tried > 1) {
-            failure = "当前免费计划里没有可用的模型（已试 $tried 个）。" +
-                "请在「设置 › 免费 Token 通道」里换一个模型，或稍后再试。上游原话：${failure?.take(160)}"
+            val last = failure?.take(160)
+            failure = if (isQuotaLike(last)) {
+                "上游免费额度已用尽（已试 $tried 个模型）。这个额度按设备和网络计，" +
+                    "本地清缓存/重装都不会恢复；等它重置，或在「设置 › API Key 池」里" +
+                    "填自己的 Key —— 免费额度用尽时号池会自动接手，不用手动换模型。" +
+                    "上游原话：$last"
+            } else {
+                "当前免费计划里没有可用的模型（已试 $tried 个）。" +
+                    "请在「设置 › 免费 Token 通道」里换一个模型，或稍后再试。上游原话：$last"
+            }
         }
         // 免费池额度用尽 / 计划不允许：如果用户配了 API Key 号池，把同一个请求
         // 原样转过去继续，而不是让对话停在一句英文报错上。
@@ -896,11 +904,17 @@ class OpenAiBridgeServer(
          */
         const val IDLE_TIMEOUT_MS = 90_000L
 
-        /** 一次请求最多试几个模型；再多就是拿用户的时间赌清单里总有一个能用的。 */
-        const val MAX_MODEL_ATTEMPTS = 6
+        /**
+         * 一次请求最多试几个模型。
+         *
+         * 免费池的额度是**按模型**计的：DeepSeek 用完不代表 GLM 用完。试 6 个
+         * 时经常在「清单里能用的那个排在后面」的场景下提前放弃，所以放到 12。
+         * 单次失败大多是 403，几十毫秒就返回，不会明显拖慢。
+         */
+        const val MAX_MODEL_ATTEMPTS = 12
 
         /** 候选里来自 /api/model 清单的最多几个（其余名额留给已知免费候选）。 */
-        const val LIST_CANDIDATES = 3
+        const val LIST_CANDIDATES = 8
 
         /** 被判「不在当前计划内」的模型冷却多久（30 分钟）。 */
         const val MODEL_COOLDOWN_MS = 30 * 60 * 1000L

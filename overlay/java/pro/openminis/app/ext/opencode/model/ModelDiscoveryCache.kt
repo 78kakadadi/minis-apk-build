@@ -222,6 +222,9 @@ class ModelDiscoveryCache(
          */
         val KNOWN_FREE_CANDIDATES = listOf(
             "big-pickle",
+            // 2026-11 的免费池：清单里最常见的几个，放在前面让回退先试
+            "deepseek-v4.1-flash-free",
+            "glm-5.3-flash-free",
             "deepseek-v4-flash-free",
             "mimo-v2.5-free",
             "nemotron-3-ultra-free",
