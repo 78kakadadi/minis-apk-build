@@ -95,6 +95,29 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
         }
     }
 
+    /**
+     * 登录要借用本地运行时的凭据接口，所以必须先有服务在跑。
+     *
+     * 之前按钮只在 Running 时可点，通道没启用时干脆整排隐藏——用户进页面只看到
+     * 一段说明文字，看起来就是「没有登录按钮」。现在点按钮自己把通道拉起来。
+     */
+    suspend fun ensureRunning(): Boolean {
+        if (manager.status.value is FreeTokenStatus.Running) return true
+        if (manager.status.value !is FreeTokenStatus.Working) {
+            withContext(Dispatchers.IO) { runCatching { manager.enable() } }
+        }
+        // 首次启动要准备运行时目录、建服务、等端口就绪，给足 90 秒
+        repeat(180) {
+            delay(500)
+            when (manager.status.value) {
+                is FreeTokenStatus.Running -> return true
+                is FreeTokenStatus.Error -> return false
+                else -> Unit
+            }
+        }
+        return manager.status.value is FreeTokenStatus.Running
+    }
+
     // 只在「真正可请求」时拉账号；刷新模型期间状态会短暂变成 Working，
     // 这时保留上一轮结果，否则界面会闪一下「匿名使用」。
     LaunchedEffect(running, off) {
@@ -172,14 +195,15 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
                 val active = accounts?.firstOrNull { it.active }
                 Text(
                     text = when {
-                        !running && !working -> "通道未运行"
+                        working -> "启动中…"
+                        !running -> "未启用"
                         accounts == null -> "读取中…"
                         active != null -> "已登录"
                         else -> "匿名使用"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = when {
-                        !running -> MaterialTheme.colorScheme.onSurfaceVariant
+                        !running -> ACC_WARN
                         active != null -> ACC_OK
                         else -> ACC_WARN
                     },
@@ -200,70 +224,87 @@ fun OpencodeAccountCard(manager: FreeTokenManager) {
 
             if (!running && !working) {
                 Text(
-                    text = "先在页面上方「启用通道」，账号登录要借用本地运行时的凭据接口。",
+                    text = "通道还没启用：点下面的登录按钮会自动把它启动起来，不用先去上面点「启用通道」。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            } else {
-                val list = accounts.orEmpty()
-                if (list.isNotEmpty()) {
-                    list.forEach { acc ->
-                        AccountRow(
-                            account = acc,
-                            busy = busy != null,
-                            onSwitch = {
-                                scope.launch {
-                                    busy = "switch"
-                                    val r = withContext(Dispatchers.IO) {
-                                        runCatching { manager.account.activate(acc.id) }
-                                    }
-                                    busy = null
-                                    r.onSuccess {
-                                        notice = "已切换到：${acc.label}，正在按账号重启运行时…"
-                                        manager.restart()
-                                    }.onFailure {
-                                        notice = "切换失败：${it.message}"
-                                    }
-                                    reload()
-                                }
-                            },
-                            onLogout = { logoutTarget = acc },
-                        )
-                    }
-                    Spacer(Modifier.height(2.dp))
-                }
+            }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = {
-                            busy = "device"
-                            notice = null
+            val list = accounts.orEmpty()
+            if (list.isNotEmpty()) {
+                list.forEach { acc ->
+                    AccountRow(
+                        account = acc,
+                        busy = busy != null,
+                        onSwitch = {
                             scope.launch {
+                                busy = "switch"
                                 val r = withContext(Dispatchers.IO) {
-                                    runCatching { manager.account.startDeviceLogin() }
+                                    runCatching { manager.account.activate(acc.id) }
                                 }
                                 busy = null
-                                r.onSuccess { device = it }
-                                    .onFailure { notice = "发起登录失败：${it.message}" }
+                                r.onSuccess {
+                                    notice = "已切换到：${acc.label}，正在按账号重启运行时…"
+                                    manager.restart()
+                                }.onFailure {
+                                    notice = "切换失败：${it.message}"
+                                }
+                                reload()
                             }
                         },
-                        enabled = busy == null && running,
-                    ) { Text(if (busy == "device") "请求中…" else "浏览器登录") }
-
-                    OutlinedButton(
-                        onClick = { showKeyDialog = true },
-                        enabled = busy == null && running,
-                    ) { Text("用 API Key 登录") }
-                }
-
-                if (list.isEmpty()) {
-                    Text(
-                        text = "提示：登录本身不会凭空多出免费额度。账号没有订阅时，免费池仍按账号额度计；" +
-                            "要立刻不受限，用「API Key 池」挂自己的 Key 更稳。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        onLogout = { logoutTarget = acc },
                     )
                 }
+                Spacer(Modifier.height(2.dp))
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        busy = "device"
+                        notice = null
+                        scope.launch {
+                            if (!ensureRunning()) {
+                                busy = null
+                                notice = "本地运行时没启动起来，看页面上方状态卡里的失败原因。"
+                                return@launch
+                            }
+                            val r = withContext(Dispatchers.IO) {
+                                runCatching { manager.account.startDeviceLogin() }
+                            }
+                            busy = null
+                            r.onSuccess { device = it }
+                                .onFailure { notice = "发起登录失败：${it.message}" }
+                        }
+                    },
+                    enabled = busy == null,
+                ) { Text(if (busy == "device") "启动中…" else "登录 OpenCode 账号") }
+
+                OutlinedButton(
+                    onClick = {
+                        notice = null
+                        scope.launch {
+                            busy = "key"
+                            val ready = ensureRunning()
+                            busy = null
+                            if (ready) {
+                                showKeyDialog = true
+                            } else {
+                                notice = "本地运行时没启动起来，看页面上方状态卡里的失败原因。"
+                            }
+                        }
+                    },
+                    enabled = busy == null,
+                ) { Text("用 API Key 登录") }
+            }
+
+            if (list.isEmpty() && (running || working)) {
+                Text(
+                    text = "提示：登录本身不会凭空多出免费额度。账号没有订阅时，免费池仍按账号额度计；" +
+                        "要立刻不受限，用「API Key 池」挂自己的 Key 更稳。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             notice?.let {
