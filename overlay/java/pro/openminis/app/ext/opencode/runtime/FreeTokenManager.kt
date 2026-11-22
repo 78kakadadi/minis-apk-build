@@ -67,6 +67,8 @@ class FreeTokenManager private constructor(context: Context) {
     init {
         // 热力图 / Token 用量的持久化宿主：单例创建时恢复历史事件
         pro.openminis.app.ext.usage.UsageCenter.init(app)
+        // 号池：免费通道额度用尽时由它接手，所以要在桥接启动前准备好
+        pro.openminis.app.ext.keypool.KeyPoolRegistry.init(app)
     }
 
     private val http = OkHttpClient.Builder()
@@ -106,6 +108,16 @@ class FreeTokenManager private constructor(context: Context) {
                     }
                 }
             }
+        },
+        onQuotaExhausted = { body, stream, out ->
+            // 免费池额度用尽时，把同一个请求交给「API Key 号池」继续。
+            // headerAlreadySent=stream：桥接在尝试本地模型前已经写过 SSE 头。
+            pro.openminis.app.ext.keypool.KeyPoolRegistry.forwardChat(
+                body = body,
+                stream = stream,
+                out = out,
+                headerAlreadySent = stream,
+            )
         },
     )
 

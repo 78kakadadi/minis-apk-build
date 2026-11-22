@@ -127,6 +127,30 @@ class KeyPool(
     }
 
     /**
+     * 取一把可用且不在 [exclude] 里的 Key。
+     *
+     * 单次请求内部换 Key 用它：同一请求重试时不能让 [acquire] 的粘性
+     * 把刚刚失败的那把又还回来。
+     */
+    fun acquireExcluding(
+        provider: String,
+        exclude: Set<String>,
+        sessionId: String = "",
+        now: Long = clock(),
+    ): PooledKey? {
+        val candidates = keys.values.filter {
+            it.provider == provider && it.id !in exclude && isAvailable(it.id, now)
+        }
+        if (candidates.isEmpty()) return null
+        val picked = smoothWeightedPick(candidates) ?: return null
+        if (sessionId.isNotEmpty()) sticky[sessionId] = picked.id
+        return picked
+    }
+
+    fun availableCount(provider: String, now: Long = clock()): Int =
+        keys.values.count { it.provider == provider && isAvailable(it.id, now) }
+
+    /**
      * 平滑加权轮询：每轮把 totalWeight 加到各自当前权重上，选最大的，然后减去 totalWeight。
      * 比「按权重展开成数组再取模」更均匀，且不随权重增大而膨胀内存。
      */
@@ -185,10 +209,14 @@ class KeyPool(
             lastError = message.take(200),
         )
 
-        val cooldownSeconds = when (httpStatus) {
-            429 -> 60L
-            401 -> 300L
-            402 -> 1800L
+        val cooldownSeconds = when {
+             httpStatus == 429 -> 60L
+            httpStatus == 401 -> 300L
+            httpStatus == 402 -> 1800L
+            // 额度耗尽的文案五花八门：有的中转站回 403，有的回 400，还有的
+            // 200 里塞 error 让调用方自己判断。只看状态码会漏掉一大半，
+            // 这类错误换 Key 是唯一有效的处理。
+            isQuotaExhausted(httpStatus, message) -> 1800L
             else -> null
         }
 
@@ -216,6 +244,28 @@ class KeyPool(
                 else -> "HTTP $httpStatus"
             },
         )
+    }
+
+    /**
+     * 是否是「这把 Key 的额度没了」。
+     *
+     * 不看状态码只看文案会误伤内容审核（也会带 limit 字样），所以要求
+     * 4xx 且命中额度类词汇。反过来只看 402 又会漏掉 OpenCode Zen 这类
+     * 403 `permission_denied` + `free usage limit` 的写法。
+     */
+    private fun isQuotaExhausted(httpStatus: Int?, message: String): Boolean {
+        if (httpStatus == null) return false
+        // 200 也要认：OpenAI 兼容层常用「200 + error 体」表示额度不足
+        if (httpStatus != 200 && httpStatus !in 400..499) return false
+        if (httpStatus == 401 || httpStatus == 429) return false
+        val m = message.lowercase()
+        if (m.isBlank()) return false
+        val quotaWords = listOf(
+            "quota", "free usage", "usage limit", "rate limit", "credit",
+            "balance", "insufficient", "exceeded", "exhausted", "额度",
+            "余额", "配额", "已用完", "用尽", "欠费",
+        )
+        return quotaWords.any { m.contains(it) }
     }
 
     /** 冷却到期、等待探活的 Key。调用方拿去做一次轻量请求确认是否恢复。 */

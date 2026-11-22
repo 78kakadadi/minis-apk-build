@@ -54,6 +54,15 @@ class OpenAiBridgeServer(
      * 宿主用它把默认模型改成真正可用的那个，免得下一轮又从 403 开始试。
      */
     private val onModelConfirmed: (String) -> Unit = {},
+    /**
+     * 免费额度用尽时的降级出口（API Key 号池）。
+     *
+     * 参数：原始 OpenAI 请求体、是否流式、输出流。返回 true 表示已经写出完整响应。
+     * 为什么把**原始请求体**交出去而不是重新拼一个：用户配的号池模型与免费模型
+     * 可以完全不同，重新拼容易丢字段（图片、工具白名单、思考强度）；交给号池
+     * 自己替换 model 更可靠。
+     */
+    private val onQuotaExhausted: ((ByteArray, Boolean, OutputStream) -> Boolean)? = null,
 ) {
 
     @Volatile
@@ -280,9 +289,11 @@ class OpenAiBridgeServer(
         var usedModel = model
         var tried = 0
         var allUnavailable = true
+        var emittedAny = false
         for (candidate in candidatesFor(model)) {
             tried++
             val attempt = runAttempt(candidate, transcript, toolRule, id, created, stream, out)
+            if (attempt.emitted) emittedAny = true
             if (attempt.ok) {
                 text = attempt.text
                 usageSeen = attempt.usage
@@ -306,6 +317,22 @@ class OpenAiBridgeServer(
             failure = "当前免费计划里没有可用的模型（已试 $tried 个）。" +
                 "请在「设置 › 免费 Token 通道」里换一个模型，或稍后再试。上游原话：${failure?.take(160)}"
         }
+        // 免费池额度用尽 / 计划不允许：如果用户配了 API Key 号池，把同一个请求
+        // 原样转过去继续，而不是让对话停在一句英文报错上。
+        // 必须放在写收尾块之前：号池要接管整个响应（包括它自己的 [DONE]）。
+        if (!succeeded && !emittedAny && failure != null && onQuotaExhausted != null &&
+            (allUnavailable || isQuotaLike(failure))
+        ) {
+            log("免费通道不可用（${failure.take(120)}），尝试转交 API Key 号池")
+            val handled = runCatching { onQuotaExhausted.invoke(req.body, stream, out) }
+                .getOrElse { e ->
+                    log("号池转交异常：${e.message}")
+                    false
+                }
+            if (handled) return
+            log("号池没有接手，按原错误返回")
+        }
+
         // 回退成功说明这个模型才是当前计划真正允许的，记下来，下次别再撞 403
         if (succeeded && usedModel != model) {
             runCatching { onModelConfirmed(usedModel) }
@@ -583,7 +610,24 @@ class OpenAiBridgeServer(
             s.contains("permission_denied") ||
             s.contains("model is not available") ||
             s.contains("model not available") ||
+            isQuotaLike(s) ||
             (s.contains("403") && s.contains("model"))
+    }
+
+    /**
+     * 额度类失败。
+     *
+     * OpenCode Zen 的免费池满额时并不会说「模型不存在」，而是
+     * `Free usage limit reached. Connect a provider or subscribe to OpenCode Go`。
+     * 这种既该换模型、也该被号池接手——否则用户只能看到一句英文。
+     */
+    private fun isQuotaLike(message: String?): Boolean {
+        if (message.isNullOrBlank()) return false
+        val s = message.lowercase()
+        return listOf(
+            "free usage", "usage limit", "quota", "exceeded", "insufficient",
+            "credit", "balance", "额度", "余额", "配额", "用尽",
+        ).any { s.contains(it) }
     }
 
     private class StopStream : RuntimeException()

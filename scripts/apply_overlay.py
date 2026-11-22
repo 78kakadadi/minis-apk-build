@@ -31,6 +31,7 @@ def patch(path: pathlib.Path, old: str, new: str, label: str, marker: str) -> No
 
 def main() -> None:
     settings = ROOT / "ui/settings/SettingsScreen.kt"
+    app_file = ROOT / "MinisApp.kt"
     nav = ROOT / "ui/navigation/AppNavigation.kt"
 
     for f in (settings, nav):
@@ -141,7 +142,7 @@ def main() -> None:
         "                    icon = Icons.Outlined.Shield,\n"
         "                    iconColor = Color(0xFF5856D6),\n"
         '                    title = "API Key 池",\n'
-        '                    subtitle = "多 Key 加权轮询与差异化冷却",\n'
+        '                    subtitle = "一个地址多把 Key，额度用尽自动换",\n'
         "                    onClick = onKeyPoolClick,\n"
         "                )\n"
         "                SettingsItem(\n"
@@ -579,6 +580,19 @@ def main() -> None:
         "            ) {",
         "底部按钮常驻",
         "hasGroupChats(context))\n            ) {",
+    )
+
+    # 31) MinisApp：冷启动就拉起号池网关。
+    #     号池注册成了普通 provider，用户可能在没进过设置页的情况下直接聊天，
+    #     等 UI 打开再启动就晚了。
+    patch(
+        app_file,
+        "        pro.openminis.app.service.OAuthWaitKeepAlive.install(this)\n",
+        "        pro.openminis.app.service.OAuthWaitKeepAlive.install(this)\n"
+        "        // API Key 号池：注册成普通 provider 后需要常驻本地网关\n"
+        "        pro.openminis.app.ext.keypool.KeyPoolRegistry.init(this)\n",
+        "号池冷启动",
+        "ext.keypool.KeyPoolRegistry.init(this)",
     )
 
     print("注入完成。")
