@@ -129,6 +129,16 @@ class FreeTokenManager private constructor(context: Context) {
 
     val defaultModel: String? get() = store.defaultModel
 
+    /**
+     * OpenCode 账号接入（登录 / 退出 / 切换）。
+     *
+     * 免费池的额度是按设备与网络计的，登录后改用自己账号的额度与订阅——
+     * 这是「免费额度用完」唯一能靠应用侧解决的出口（另一条是 API Key 号池）。
+     */
+    val account = pro.openminis.app.ext.opencode.account.OpencodeAccountService(
+        service = { installer.readService() },
+    )
+
     fun modelsBlocking(): List<FreeModel> = _models.value
 
     // ---- 生命周期 ---------------------------------------------------------

@@ -199,6 +199,10 @@ fun FreeTokenSettingsScreen(onBack: () -> Unit) {
                 }
             }
 
+            // ---------- 账号 ----------
+            // 免费池额度按设备与网络计，登录自己的账号是应用内换额度线的唯一入口
+            OpencodeAccountCard(manager)
+
             // ---------- 模型 ----------
             Card(
                 modifier = Modifier.fillMaxWidth(),

@@ -66,7 +66,7 @@ def main() -> None:
         "                    icon = Icons.Outlined.BarChart,\n"
         "                    iconColor = Color(0xFF32D74B),\n"
         '                    title = "免费 Token 通道",\n'
-        '                    subtitle = "内嵌 OpenCode，无需 API Key",\n'
+        '                    subtitle = "内嵌 OpenCode，可登录账号或免 Key 使用",\n'
         "                    onClick = onFreeTokenClick,\n"
         "                    showDivider = false,\n"
         "                )\n"
