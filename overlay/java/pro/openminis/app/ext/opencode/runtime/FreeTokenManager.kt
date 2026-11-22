@@ -93,6 +93,20 @@ class FreeTokenManager private constructor(context: Context) {
         http = http,
         models = { _models.value },
         log = { writeLog("bridge", it) },
+        onModelConfirmed = { id ->
+            // 上游按 plan 拒绝某些模型时，桥接会自动回退。回退成功的那个才是
+            // 当前账号真能用的，记成默认值——否则每条消息都要先撞一次 403。
+            scope.launch {
+                if (store.defaultModel != id) {
+                    store.defaultModel = id
+                    writeLog("bridge", "默认模型切换为可用模型：$id")
+                    val current = _status.value
+                    if (current is FreeTokenStatus.Running) {
+                        _status.value = current.copy(model = id)
+                    }
+                }
+            }
+        },
     )
 
     @Volatile
@@ -296,11 +310,18 @@ class FreeTokenManager private constructor(context: Context) {
             return
         }
 
-        val found = discovery.selectFree(payload)
+        var found = discovery.selectFree(payload)
         writeLog("models", "发现 ${found.size} 个免费模型：${found.joinToString { it.id }}")
         if (found.isEmpty()) {
-            modelError = "服务端返回了模型清单，但里面没有免费模型"
+            // 清单里没有明确免费的模型时，别让选择器空着——用已知候选兜底。
+            // 上游的免费池名单变动频繁，本地这份至少能让用户有东西可试，
+            // 请求时桥接还会再做一次按 plan 的回退。
+            found = ModelDiscoveryCache.KNOWN_FREE_CANDIDATES.map { FreeModel(it, it, "opencode") }
+            writeLog("models", "清单里没有免费模型，改用已知候选兜底：${found.joinToString { it.id }}")
             writeLog("models", "清单原文（前 600 字）：${payload.take(600)}")
+        }
+        if (found.isEmpty()) {
+            modelError = "服务端返回了模型清单，但里面没有可用模型"
         } else {
             modelError = null
             _models.value = found

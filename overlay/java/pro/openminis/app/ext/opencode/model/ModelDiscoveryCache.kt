@@ -75,16 +75,38 @@ class ModelDiscoveryCache(
         return preferKnown(out.toList())
     }
 
-    /** 2.x 的扁平列表。id 取 `modelID`（有些版本 id 带 provider 前缀）。 */
-    private fun parseFlat(flat: JsonArray): List<FreeModel> =
-        flat.mapNotNull { e ->
+    /**
+     * 2.x 的扁平列表。id 取 `modelID`（有些版本 id 带 provider 前缀）。
+     *
+     * `enabled` 是服务端给出的「当前账号/计划是否可用」。它默认 true，但清单里
+     * 常有一批 `enabled:false` 的模型（存在、可展示，但请求会被 403
+     * `model is not available in the current token plan`）。以前忽略了它，
+     * 结果选择器里一排模型点哪个都发不出去。这里直接排除，从源头少踩一脚。
+     */
+    private fun parseFlat(flat: JsonArray): List<FreeModel> {
+        // 整份清单都不带价格，说明这个服务端根本不填 cost（免费池就是这样）。
+        // 此时「没有价格」等价于「没有计费」，不能因为字段缺失就把模型全丢掉。
+        // 反过来，只要清单里有模型标了价，就说明 cost 是可信的，缺失的不能算免费。
+        val costReported = flat.any { e ->
+            val c = (e as? JsonObject)?.get("cost") as? JsonArray
+            c != null && c.isNotEmpty()
+        }
+        return flat.mapNotNull { e ->
             val o = e as? JsonObject ?: return@mapNotNull null
             val id = o.str("modelID") ?: o.str("id") ?: return@mapNotNull null
             val name = o.str("name") ?: ""
             val pid = o.str("providerID") ?: "opencode"
-            if (!isFree(o, id, name)) return@mapNotNull null
+            if (!isEnabled(o)) return@mapNotNull null
+            if (!isFree(o, id, name, missingCostIsFree = !costReported)) return@mapNotNull null
             FreeModel(id = id, name = name, providerId = pid)
         }
+    }
+
+    /** 只有显式 `false` 才算禁用；字段缺失按可用处理（旧版本没有这个字段）。 */
+    private fun isEnabled(model: JsonObject): Boolean {
+        val v = model["enabled"] as? JsonPrimitive ?: return true
+        return v.content.toBooleanStrictOrNull() ?: true
+    }
 
     /**
      * 免费判定。
@@ -93,17 +115,25 @@ class ModelDiscoveryCache(
      * 名字里的 "free" 是营销文案，会变；价格字段是计费口径，骗不了人。
      * `cost` 缺失时才回落到名字/已知清单。
      */
-    private fun isFree(model: JsonObject, id: String, name: String): Boolean {
+    private fun isFree(
+        model: JsonObject,
+        id: String,
+        name: String,
+        missingCostIsFree: Boolean = false,
+    ): Boolean {
         val cost = model["cost"] as? JsonArray
-        if (cost != null && cost.isNotEmpty()) {
-            val allZero = cost.all { c ->
-                val o = c as? JsonObject ?: return@all false
-                val input = (o["input"] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: return@all false
-                val output = (o["output"] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: return@all false
-                input == 0.0 && output == 0.0
-            }
-            if (allZero) return true
+        if (cost == null || cost.isEmpty()) {
+            if (missingCostIsFree) return true
+            val known = id in KNOWN_FREE_SET
+            return known || looksFree(id) || looksFree(name)
         }
+        val allZero = cost.all { c ->
+            val o = c as? JsonObject ?: return@all false
+            val input = (o["input"] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: return@all false
+            val output = (o["output"] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: return@all false
+            input == 0.0 && output == 0.0
+        }
+        if (allZero) return true
         val known = id in KNOWN_FREE_SET
         return known || looksFree(id) || looksFree(name)
     }

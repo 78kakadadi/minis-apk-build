@@ -3,6 +3,7 @@ package pro.openminis.app.ext.opencode.bridge
 import pro.openminis.app.ext.opencode.api.OpencodeServerClient
 import pro.openminis.app.ext.opencode.api.StreamEvent
 import pro.openminis.app.ext.opencode.model.FreeModel
+import pro.openminis.app.ext.opencode.model.ModelDiscoveryCache
 import pro.openminis.app.ext.group.GroupTools
 import pro.openminis.app.ext.opencode.runtime.ServiceConfig
 import pro.openminis.app.ext.usage.UsageCenter
@@ -47,6 +48,12 @@ class OpenAiBridgeServer(
     private val http: OkHttpClient,
     private val models: () -> List<FreeModel>,
     private val log: (String) -> Unit = {},
+    /**
+     * 请求的模型被上游拒（不在当前计划内）、回退到别的模型并成功时回调。
+     *
+     * 宿主用它把默认模型改成真正可用的那个，免得下一轮又从 403 开始试。
+     */
+    private val onModelConfirmed: (String) -> Unit = {},
 ) {
 
     @Volatile
@@ -62,13 +69,22 @@ class OpenAiBridgeServer(
     private val seq = AtomicInteger(0)
 
     /**
+     * 模型冷却表：id -> 判为「不在当前 token 计划内」的时刻。
+     *
+     * 上游的 plan 限制是按账号走的，短时间内不会变，半小时内不必反复撞同一个
+     * 403。冷却只影响桥接选模型的顺序，不改清单本身——用户仍可手动选它。
+     */
+    private val cooledModels = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
      * 查用量专用的短超时客户端。
      *
      * 回复已经流完、只差 [DONE] 时去查会话；如果沿用 180 秒 readTimeout，
-     * 服务端一次卡顿就会让用户盯着「已经答完但还在转圈」。1.5 秒足够本地读一次。
+     * 服务端一次卡顿就会让用户盯着「已经答完但还在转圈」。800 毫秒足够本地读一次，
+     * 读不到就按估算走——宁可数字粗一点，也不能把回复卡住。
      */
     private val usageHttp: OkHttpClient = http.newBuilder()
-        .callTimeout(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .callTimeout(800, java.util.concurrent.TimeUnit.MILLISECONDS)
         .build()
 
     val baseUrl: String get() = "http://127.0.0.1:$port"
@@ -247,21 +263,144 @@ class OpenAiBridgeServer(
             return
         }
 
-        // 2.x 的模型是在建会话时选定的，所以先把 id 映射回 {id, providerID}
-        val target = resolveModel(model)
-        val client = OpencodeServerClient(http, svc) { log(it) }
-        val usageClient = OpencodeServerClient(usageHttp, svc) { log(it) }
-        val sid = client.createSession(
-            model = target,
-            title = "minis-${System.currentTimeMillis()}",
-            permissions = toolRule?.let { GroupTools.permissionRules(it) },
-        )
+        // 2.x 的模型是在建会话时选定的，所以先把 id 映射回 {id, providerID}。
+        //
+        // 「免费」不等于「当前 token 计划可用」：上游对计划外的模型直接回
+        // 403 permission_denied（model is not available in the current token plan）。
+        // 以前这里只发一次，失败就把 403 原样丢给用户——表现就是「免费通道用不了」。
+        // 现在按清单顺序换模型重试，坏模型冷却半小时，用户侧无感。
         val id = "chatcmpl-${seq.incrementAndGet()}"
         val created = System.currentTimeMillis() / 1000
-
         if (stream) writeSseHeader(out)
 
+        var failure: String? = null
+        var text = StringBuilder()
+        var usageSeen: pro.openminis.app.ext.opencode.api.TokenUsage? = null
+        var succeeded = false
+        var usedModel = model
+        var tried = 0
+        var allUnavailable = true
+        for (candidate in candidatesFor(model)) {
+            tried++
+            val attempt = runAttempt(candidate, transcript, toolRule, id, created, stream, out)
+            if (attempt.ok) {
+                text = attempt.text
+                usageSeen = attempt.usage
+                usedModel = candidate.id
+                succeeded = true
+                // 前面attempt 的失败不能带进最终响应：已经回退成功了
+                failure = null
+                break
+            }
+            failure = attempt.error ?: "上游没有返回内容"
+            // 已经输出过正文就不再换模型：重来会让用户看到两段回答拼在一起
+            if (attempt.emitted || !isModelUnavailable(attempt.error)) {
+                allUnavailable = false
+                break
+            }
+            cooledModels[candidate.id] = System.currentTimeMillis()
+            log("模型 ${candidate.id} 不在当前 token 计划内，换下一个：${attempt.error?.take(160)}")
+        }
+        // 逐个都撞了 plan 限制：这不是网络问题，别让用户对着一句 403 猜
+        if (!succeeded && allUnavailable && tried > 1) {
+            failure = "当前免费计划里没有可用的模型（已试 $tried 个）。" +
+                "请在「设置 › 免费 Token 通道」里换一个模型，或稍后再试。上游原话：${failure?.take(160)}"
+        }
+        // 回退成功说明这个模型才是当前计划真正允许的，记下来，下次别再撞 403
+        if (succeeded && usedModel != model) {
+            runCatching { onModelConfirmed(usedModel) }
+        }
+
+        if (stream) {
+            runCatching {
+                // 先补一个只带 usage、choices 为空的收尾块：Minis 的 OpenAI 解析器
+                // 会独立读取 usage 字段，据此把 token 写进消息、Token 用量页才算得到。
+                usageSeen?.takeIf { !it.isEmpty }?.let { emitUsage(out, id, created, usedModel, it) }
+                if (failure != null) {
+                    out.write(
+                        "data: ${JSONObject().put("error", JSONObject().put("message", failure)).toString()}\n\n"
+                            .toByteArray(Charsets.UTF_8),
+                    )
+                }
+                out.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+                out.flush()
+            }
+            return
+        }
+
+        if (failure != null || !succeeded) {
+            writeJson(
+                out,
+                502,
+                JSONObject().put(
+                    "error",
+                    JSONObject().put("message", failure ?: "没有可用的免费模型").put("type", "upstream_error"),
+                ).toString(),
+            )
+            return
+        }
+
+        val resp = JSONObject()
+            .put("id", id)
+            .put("object", "chat.completion")
+            .put("created", created)
+            .put("model", usedModel)
+            .put(
+                "choices",
+                JSONArray().put(
+                    JSONObject()
+                        .put("index", 0)
+                        .put("message", JSONObject().put("role", "assistant").put("content", text.toString()))
+                        .put("finish_reason", "stop"),
+                ),
+            )
+        usageSeen?.takeIf { !it.isEmpty }?.let { resp.put("usage", usageJson(it)) }
+        writeJson(out, 200, resp.toString())
+    }
+
+    /** 单次尝试的结果。[emitted] 表示已经向客户端写过正文。 */
+    private class Attempt(
+        val ok: Boolean,
+        val text: StringBuilder,
+        val usage: pro.openminis.app.ext.opencode.api.TokenUsage?,
+        val error: String?,
+        val emitted: Boolean,
+    )
+
+    /**
+     * 用指定模型完整跑一轮：建会话 → 订阅事件 → 发 prompt → 收正文。
+     *
+     * 抽出来是为了让外层能在「模型不在当前计划内」时换一个重来。
+     * 这里不写 SSE 头、不写 [DONE]、不 decision 是否重试——那些都是外层的职责。
+     */
+    private fun runAttempt(
+        target: FreeModel,
+        transcript: String,
+        toolRule: Set<String>?,
+        id: String,
+        created: Long,
+        stream: Boolean,
+        out: OutputStream,
+    ): Attempt {
+        val svc = service()
+            ?: return Attempt(false, StringBuilder(), null, "免费通道尚未就绪（本地服务未启动）", false)
+        val client = OpencodeServerClient(http, svc) { log(it) }
+        val usageClient = OpencodeServerClient(usageHttp, svc) { log(it) }
+        val actualModel = target.id
+
+        // 403 通常就出在建会话这一步：服务端按 plan 校验模型，直接拒绝
+        val sid = try {
+            client.createSession(
+                model = target,
+                title = "minis-${System.currentTimeMillis()}",
+                permissions = toolRule?.let { GroupTools.permissionRules(it) },
+            )
+        } catch (e: Exception) {
+            return Attempt(false, StringBuilder(), null, e.message ?: e.javaClass.simpleName, false)
+        }
+
         val text = StringBuilder()
+        var emitted = false
         var finished = false
         var failure: String? = null
         var started = false
@@ -271,9 +410,7 @@ class OpenAiBridgeServer(
         // 「回答完了，对话却不结束」。90 秒全静默（连 delta/thinking 都没有）
         // 只可能是服务端挂了，强制收尾。
         var lastEventAt = System.currentTimeMillis()
-        // usage 快照：session.usage.updated 会在结束事件前后各发一次，收到就记
         var usageSeen: pro.openminis.app.ext.opencode.api.TokenUsage? = null
-        val actualModel = target.id
 
         runBlocking {
             val collector = this
@@ -286,7 +423,10 @@ class OpenAiBridgeServer(
                         // 结束块。把 finished 置上让 finally 正常给上游发 [DONE]。
                         if (text.isNotBlank()) {
                             finished = true
-                            if (stream) emitDelta(out, id, created, model, null, "stop", null)
+                            if (stream) {
+                                emitDelta(out, id, created, actualModel, null, "stop", null)
+                                emitted = true
+                            }
                         } else {
                             failure = "opencode $IDLE_TIMEOUT_MS/1000 秒没有任何事件，连接被重置"
                         }
@@ -311,11 +451,17 @@ class OpenAiBridgeServer(
                         }
                         is StreamEvent.Text -> {
                             text.append(ev.text)
-                            if (stream) emitDelta(out, id, created, model, ev.text, null, null)
+                            if (stream) {
+                                emitDelta(out, id, created, actualModel, ev.text, null, null)
+                                emitted = true
+                            }
                         }
                         is StreamEvent.Reasoning -> {
                             // OpenAI 客户端不认识这个字段，但自家的群聊引擎会读
-                            if (stream) emitDelta(out, id, created, model, null, null, ev.text)
+                            if (stream) {
+                                emitDelta(out, id, created, actualModel, null, null, ev.text)
+                                emitted = true
+                            }
                         }
                         is StreamEvent.ToolSettled -> {
                             // 工具是 opencode 在设备上真跑完的（shell/read/write…），
@@ -327,12 +473,18 @@ class OpenAiBridgeServer(
                                 // 工具先于正文时，别让消息以两个空行开头
                                 val piece = if (text.isEmpty()) block.trimStart() else block
                                 text.append(piece)
-                                if (stream) emitDelta(out, id, created, model, piece, null, null)
+                                if (stream) {
+                                    emitDelta(out, id, created, actualModel, piece, null, null)
+                                    emitted = true
+                                }
                             }
                         }
                         is StreamEvent.Finished -> {
                             finished = true
-                            if (stream) emitDelta(out, id, created, model, null, ev.stopReason, null)
+                            if (stream) {
+                                emitDelta(out, id, created, actualModel, null, ev.stopReason, null)
+                                emitted = true
+                            }
                         }
                         is StreamEvent.Failed -> failure = ev.message
                         is StreamEvent.UsageTotal -> usageSeen = ev.usage
@@ -343,32 +495,27 @@ class OpenAiBridgeServer(
                 if (!finished && failure == null) failure = "事件流提前结束（未收到结束事件）"
             } catch (e: StopStream) {
                 // 正常收尾
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // watchdog 主动收尾时 cancel 会走到这里，别把已完成的回复记成失败
+                if (!finished && failure == null) failure = "生成被中断"
             } catch (e: Exception) {
                 failure = failure ?: (e.message ?: e.javaClass.simpleName)
             } finally {
                 watchdog.cancel()
-                // 会话不能在这里删：用量事件常常晚于结束事件，删掉就再也查不到
-                // tokens 了。放到下面「取用量之后」统一删。
+                // 会话不能在这里删：用量事件常常晚于结束事件，删掉就再也查不到 tokens 了
             }
         }
 
-        // 结束事件先于用量事件到达是常态（实测里十次有九次如此）。先给瞬时事件
-        // 一点时间，再用会话信息里的最终 tokens 兜底；两条路都拿不到，才认定这个
-        // 通道确实没上报用量。
+        // 用量补齐：只查一次、走 800ms 短超时。这里以前是「3 次 × 1.5 秒 + sleep」，
+        // 一旦服务端读会话慢，每条消息都要多等 5 秒，用户体感就是「卡死」。
         if (usageSeen == null) {
-            usageFetch@ for (attempt in 0 until 3) {
-                val fetched = runCatching { usageClient.sessionUsage(sid) }.getOrNull()
-                if (fetched != null && !fetched.isEmpty) {
-                    usageSeen = fetched
-                    log("用量从会话信息补齐：${fetched.total} tokens（model=$actualModel）")
-                    break@usageFetch
-                }
-                if (attempt < 2) runCatching { Thread.sleep(350L) }
+            val fetched = runCatching { usageClient.sessionUsage(sid) }.getOrNull()
+            if (fetched != null && !fetched.isEmpty) {
+                usageSeen = fetched
+                log("用量从会话信息补齐：${fetched.total} tokens（model=$actualModel）")
             }
         }
-        // 最后的兜底：个别通道（以及被上游吞掉 usage 的网关）什么都不报。
-        // 这种情况下宁可给一个按字符估算的量级，也不要让用量页永远停在 0——
-        // 但要在热力图上标成「未上报」，别把估算当实测。
+        // 最后的兜底：个别通道什么都不报。给一个按字符估算的量级，但热力图标「未上报」。
         var estimatedUsage = false
         val knownUsage = usageSeen
         if ((knownUsage == null || knownUsage.isEmpty) && text.isNotBlank()) {
@@ -379,10 +526,10 @@ class OpenAiBridgeServer(
                 log("通道未上报用量，按字符估算 ${est.total} tokens（model=$actualModel）")
             }
         }
-        runCatching { client.deleteSession(sid) }
+        // 删除也用短超时客户端：DELETE 若卡住，180 秒的 readTimeout 会占死桥接线程
+        runCatching { usageClient.deleteSession(sid) }
 
-        // 免费通道的真实用量进热力图。普通对话与群聊的免费成员都经过这里，
-        // 是「免费 token 不计入用量」的修复点。
+        // 免费通道的真实用量进热力图。普通对话与群聊的免费成员都经过这里。
         runCatching {
             val u = usageSeen
             UsageCenter.record(
@@ -397,52 +544,46 @@ class OpenAiBridgeServer(
             )
         }
 
-        if (stream) {
-            runCatching {
-                // 先补一个只带 usage、choices 为空的收尾块：Minis 的 OpenAI 解析器
-                // 会独立读取 usage 字段，据此把 token 写进消息、Token 用量页才算得到。
-                // 不补这一块，回复再正常，用量页也永远是 0。
-                usageSeen?.takeIf { !it.isEmpty }?.let { emitUsage(out, id, created, model, it) }
-                if (failure != null) {
-                    out.write(
-                        "data: ${JSONObject().put("error", JSONObject().put("message", failure)).toString()}\n\n"
-                            .toByteArray(Charsets.UTF_8),
-                    )
-                }
-                out.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
-                out.flush()
-            }
-            return
-        }
+        return Attempt(failure == null, text, usageSeen, failure, emitted)
+    }
 
-        if (failure != null) {
-            writeJson(
-                out,
-                502,
-                JSONObject().put(
-                    "error",
-                    JSONObject().put("message", failure).put("type", "upstream_error"),
-                ).toString(),
-            )
-            return
-        }
+    /**
+     * 本次请求的候选模型：请求的那个排第一，其余按清单顺序；冷却中的跳过。
+     *
+     * 清单部分最多取 [LIST_CANDIDATES] 个，剩下的名额留给已知免费候选——
+     * `/api/model` 里「看着免费」的模型可能整批都不在当前计划内，而真正能用的
+     * 那个反倒不在清单里（或被判成收费）。全试一遍太慢，所以两边各留位置。
+     */
+    private fun candidatesFor(requested: String): List<FreeModel> {
+        val now = System.currentTimeMillis()
+        cooledModels.entries.removeAll { now - it.value > MODEL_COOLDOWN_MS }
+        val list = models()
+        val hit = list.firstOrNull { it.id == requested }
+        val ordered = LinkedHashSet<FreeModel>()
+        if (hit != null && !cooledModels.containsKey(hit.id)) ordered.add(hit)
+        list.asSequence()
+            .filterNot { it.id == hit?.id }
+            .filterNot { cooledModels.containsKey(it.id) }
+            .take(LIST_CANDIDATES)
+            .forEach { ordered.add(it) }
+        // 清单为空或全在冷却时，至少还能试一次请求的那个，别直接判「没有可用模型」
+        if (ordered.isEmpty()) (hit ?: list.firstOrNull())?.let { ordered.add(it) }
+        ModelDiscoveryCache.KNOWN_FREE_CANDIDATES.asSequence()
+            .filterNot { id -> ordered.any { it.id == id } }
+            .take(MAX_MODEL_ATTEMPTS - ordered.size)
+            .forEach { ordered.add(FreeModel(it, it, "opencode")) }
+        return ordered.take(MAX_MODEL_ATTEMPTS)
+    }
 
-        val resp = JSONObject()
-            .put("id", id)
-            .put("object", "chat.completion")
-            .put("created", created)
-            .put("model", model)
-            .put(
-                "choices",
-                JSONArray().put(
-                    JSONObject()
-                        .put("index", 0)
-                        .put("message", JSONObject().put("role", "assistant").put("content", text.toString()))
-                        .put("finish_reason", "stop"),
-                ),
-            )
-        usageSeen?.takeIf { !it.isEmpty }?.let { resp.put("usage", usageJson(it)) }
-        writeJson(out, 200, resp.toString())
+    /** 上游把「模型不在当前计划内」的失败，值得换一个模型重试。 */
+    private fun isModelUnavailable(message: String?): Boolean {
+        if (message.isNullOrBlank()) return false
+        val s = message.lowercase()
+        return s.contains("token plan") ||
+            s.contains("permission_denied") ||
+            s.contains("model is not available") ||
+            s.contains("model not available") ||
+            (s.contains("403") && s.contains("model"))
     }
 
     private class StopStream : RuntimeException()
@@ -709,6 +850,15 @@ class OpenAiBridgeServer(
          * 所以 readTimeout 在这条路径上失效，只能靠它。
          */
         const val IDLE_TIMEOUT_MS = 90_000L
+
+        /** 一次请求最多试几个模型；再多就是拿用户的时间赌清单里总有一个能用的。 */
+        const val MAX_MODEL_ATTEMPTS = 6
+
+        /** 候选里来自 /api/model 清单的最多几个（其余名额留给已知免费候选）。 */
+        const val LIST_CANDIDATES = 3
+
+        /** 被判「不在当前计划内」的模型冷却多久（30 分钟）。 */
+        const val MODEL_COOLDOWN_MS = 30 * 60 * 1000L
 
         /** 工具输出最多展示的行数/字符数：`read` 一个文件就是几百行，全贴没法看。 */
         const val MAX_TOOL_LINES = 24
