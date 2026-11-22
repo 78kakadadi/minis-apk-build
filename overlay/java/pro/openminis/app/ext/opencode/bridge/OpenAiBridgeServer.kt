@@ -320,11 +320,12 @@ class OpenAiBridgeServer(
         // 免费池额度用尽 / 计划不允许：如果用户配了 API Key 号池，把同一个请求
         // 原样转过去继续，而不是让对话停在一句英文报错上。
         // 必须放在写收尾块之前：号池要接管整个响应（包括它自己的 [DONE]）。
-        if (!succeeded && !emittedAny && failure != null && onQuotaExhausted != null &&
+        val fallback = onQuotaExhausted
+        if (!succeeded && !emittedAny && failure != null && fallback != null &&
             (allUnavailable || isQuotaLike(failure))
         ) {
             log("免费通道不可用（${failure.take(120)}），尝试转交 API Key 号池")
-            val handled = runCatching { onQuotaExhausted.invoke(req.body, stream, out) }
+            val handled = runCatching { fallback.invoke(req.body, stream, out) }
                 .getOrElse { e ->
                     log("号池转交异常：${e.message}")
                     false
